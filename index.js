@@ -34,7 +34,7 @@ function buildDimensions() {
         const field = dtFields[i];
         dims.push({
             id:`dt${i+1}`, label:`第${i+1}名 龙虎`,
-            fn: r => r[field]===1?'龙':'虎'
+            fn: r => r[field]===1?'虎':'龙'
         });
     }
     // 冠亚和 removed
