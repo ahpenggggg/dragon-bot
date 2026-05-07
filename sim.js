@@ -10,7 +10,7 @@ const API_LATEST  = ‘https://api.api168168.com/pks/getLotteryPksInfo.do?lotCod
 const API_HISTORY = ‘https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037’;
 
 const HIGHLIGHT = 70;
-const MIN_N     = 6;
+const MIN_N     = 7;
 const CHECKS    = [2, 3, 4, 5, 6, 7];
 
 // Martingale ladder — index = retryCount (0=fresh bet)
