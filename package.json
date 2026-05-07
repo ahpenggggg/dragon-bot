@@ -4,11 +4,12 @@
   "description": "168极速赛车 chase-pattern Telegram bot",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "concurrently \"node index.js\" \"node sim.js\""
   },
   "dependencies": {
     "axios": "^1.6.0",
     "cheerio": "^1.0.0",
+    "concurrently": "^8.0.0",
     "dotenv": "^16.0.0",
     "node-telegram-bot-api": "^0.64.0"
   }
