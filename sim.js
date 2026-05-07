@@ -3,8 +3,8 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const axios       = require('axios');
 
-const BOT_TOKEN = process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
-const CHAT_ID   = process.env.CHAT_ID   || 'YOUR_CHAT_ID_HERE';
+const BOT_TOKEN = process.env.SIM_BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
+const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_CHAT_ID_HERE';
 
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
