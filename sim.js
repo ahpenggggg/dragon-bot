@@ -3,8 +3,8 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const axios       = require('axios');
 
-const BOT_TOKEN = process.env.SIM_BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
-const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_CHAT_ID_HERE';
+const BOT_TOKEN = process.env.BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
+const CHAT_ID   = process.env.CHAT_ID   || 'YOUR_CHAT_ID_HERE';
 
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
@@ -137,23 +137,26 @@ function evaluateSignals() {
 }
 
 // ── Bet sizing ────────────────────────────────────────────────────────────────
+// Normal tier: standard ladder per signal
+// High tier (483+): sum of all losses * 1.1, split equally among high tier signals
 function assignBets(signals) {
     if (signals.length === 0) return [];
 
     const normal  = signals.filter(s => s.retryCount < SPLIT_FROM);
     const high    = signals.filter(s => s.retryCount >= SPLIT_FROM);
-
     const result  = [];
 
+    // Normal tier — each bets its own ladder amount
     for (const sig of normal) {
         const amt = BET_LADDER[Math.min(sig.retryCount, BET_LADDER.length-1)];
         result.push({ ...sig, betAmt: amt });
     }
 
+    // High tier — sum of all their losses * 1.1, split equally
     if (high.length > 0) {
-        const maxRetry  = Math.max(...high.map(s=>s.retryCount));
-        const totalAmt  = BET_LADDER[Math.min(maxRetry, BET_LADDER.length-1)];
-        const perSig    = Math.floor(totalAmt / high.length);
+        const sumLost    = high.reduce((sum, s) => sum + (s.totalLost || 0), 0);
+        const totalNeeded = Math.max(sumLost * 1.1, BET_LADDER[SPLIT_FROM]);
+        const perSig     = Math.ceil(totalNeeded / high.length);
         for (const sig of high) {
             result.push({ ...sig, betAmt: perSig });
         }
@@ -174,7 +177,7 @@ const fmt  = n=>n.toFixed(0);
 const bot = new TelegramBot(BOT_TOKEN,{polling:false});
 function send(text) {
     return bot.sendMessage(CHAT_ID,text,{parse_mode:'Markdown',disable_web_page_preview:true})
-              .catch(err=>console.error('[sim][send error]',err.message));
+              .catch(err=>console.error('[send error]',err.message));
 }
 
 function buildMsg(raw, bettedSignals, verResults, nextIssue) {
@@ -185,6 +188,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     const secsL = s!==null?Math.ceil(s):'—';
     const lines = [];
 
+    // Draw result
     lines.push(`\`#${raw.preDrawIssue}\`  ⏰ \`${time}\``);
     lines.push(`位置:  ${posLabels.map(l=>l.padEnd(4)).join(' ')}`);
     lines.push(`号码:  ${nums.map(n=>PAD2(n)).join('  ')}`);
@@ -192,6 +196,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     lines.push(`大小:  ${nums.map(n=>n<=5?'小':'大').join('  ')}`);
     lines.push(`冠亚和: ${raw.sumFS}  ${raw.sumFS%2!==0?'单':'双'}  ${raw.sumFS<12?'小':'大'}`);
 
+    // Verification + P&L
     if (verResults.length > 0) {
         const hits    = verResults.filter(v=>v.hit).length;
         const roundPL = verResults.reduce((sum,v)=>sum+(v.hit?v.betAmt:-v.betAmt),0);
@@ -203,10 +208,12 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
         }
     }
 
+    // Balance summary
     lines.push('');
     lines.push(`💰 余额: *${fmt(db.balance)}* | 峰值: ${fmt(db.peakBalance)} | 谷值: ${fmt(db.troughBalance)}`);
     lines.push(`📈 总投: ${fmt(db.totalBet)} | 赢: +${fmt(db.totalWin)} | 输: -${fmt(db.totalLoss)} | 净: ${db.totalWin-db.totalLoss>=0?'+':''}${fmt(db.totalWin-db.totalLoss)}`);
 
+    // Next bets
     lines.push('');
     lines.push(`\`─────────────────────────\``);
     lines.push(`📌 下批 *#${nextIssue}* 下注:`);
@@ -239,7 +246,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 async function init() {
-    console.log('[sim][init] 加载历史数据...');
+    console.log('[init] 加载历史数据...');
     let data;
     for (let attempt=1; attempt<=3; attempt++) {
         try {
@@ -247,7 +254,7 @@ async function init() {
             data = res.data;
             break;
         } catch(e) {
-            console.log('[sim][init] attempt '+attempt+' failed: '+e.message);
+            console.log('[init] attempt '+attempt+' failed: '+e.message);
             if (attempt===3) throw e;
             await new Promise(r=>setTimeout(r,3000));
         }
@@ -256,10 +263,10 @@ async function init() {
     db.rawHistory  = data.result.data.slice().reverse();
     db.startIssue  = db.rawHistory[0].preDrawIssue;
     db.lastIssue   = db.rawHistory[db.rawHistory.length-1].preDrawIssue;
-    console.log(`[sim][init] ${db.rawHistory.length} 期 (${db.startIssue} → ${db.lastIssue})`);
+    console.log(`[init] ${db.rawHistory.length} 期 (${db.startIssue} → ${db.lastIssue})`);
     db.dims        = buildDimensions();
     db.signalTable = buildSignalTable(db.rawHistory);
-    console.log(`[sim][init] ⭐⭐ 信号表: ${db.signalTable.length} 条 (≥${HIGHLIGHT}%)`);
+    console.log(`[init] ⭐⭐ 信号表: ${db.signalTable.length} 条 (≥${HIGHLIGHT}%)`);
     db.signalTable.forEach(s=>console.log(`  [杀] ${s.label} ${s.side}连${s.len}→${s.chase} ${s.pct}% n=${s.n}`));
 }
 
@@ -267,8 +274,8 @@ async function init() {
 async function poll() {
     const s=secsToNext(), isNear=s!==null&&s<=15, nextMs=isNear?4_000:15_000;
     if (s!==null) {
-        if (!db.shownStart&&s>55){console.log('\n[sim][countdown] ▶ 新一期 ~60s');db.shownStart=true;}
-        if (!db.shownLast&&s<=30){console.log(`\n[sim][countdown] ⚠️  最后 ${Math.ceil(s)}s`);db.shownLast=true;}
+        if (!db.shownStart&&s>55){console.log('\n[countdown] ▶ 新一期 ~60s');db.shownStart=true;}
+        if (!db.shownLast&&s<=30){console.log(`\n[countdown] ⚠️  最后 ${Math.ceil(s)}s`);db.shownLast=true;}
     }
 
     let raw,nextTime,nextIssue;
@@ -276,18 +283,19 @@ async function poll() {
         const {data}=await axios.get(API_LATEST,{timeout:10_000});
         if (data.errorCode!==0) throw new Error(data.message);
         raw=data.result.data; nextTime=raw.drawTime; nextIssue=raw.drawIssue;
-    } catch(e){console.error('\n[sim][fetch error]',e.message);setTimeout(poll,nextMs);return;}
+    } catch(e){console.error('\n[fetch error]',e.message);setTimeout(poll,nextMs);return;}
 
     db.nextDrawAt=new Date(nextTime.replace(' ','T'));
 
     if (raw.preDrawIssue!==db.lastIssue) {
         db.lastIssue=raw.preDrawIssue; db.drawCount++;
         db.shownStart=false; db.shownLast=false;
-        console.log(`\n[sim][#${db.drawCount}] 期${raw.preDrawIssue} ${raw.preDrawTime.slice(11,19)}`);
+        console.log(`\n[#${db.drawCount}] 期${raw.preDrawIssue} ${raw.preDrawTime.slice(11,19)}`);
 
         db.rawHistory.push(raw);
         if (db.rawHistory.length>1000) db.rawHistory.shift();
 
+        // ── Verify pending signals ────────────────────────────────────────────
         const verResults = [];
         const carryOver  = [];
 
@@ -297,6 +305,7 @@ async function poll() {
             const actual = dim?dim.fn(raw):'?';
             const hit    = actual===ps.chase;
 
+            // P&L
             if (hit) {
                 db.balance   += ps.betAmt;
                 db.totalWin  += ps.betAmt;
@@ -310,33 +319,37 @@ async function poll() {
             db.drawsPlayed++;
 
             verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, actual, hit, betAmt:ps.betAmt });
-            console.log(`  [sim][${hit?'HIT✅':'MISS❌'}] ${ps.label} 杀${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)}`);
+            console.log(`  [${hit?'HIT✅':'MISS❌'}] ${ps.label} 杀${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)}`);
 
             if (!hit) {
-                carryOver.push({ ...ps, retryCount: ps.retryCount+1, nextIssue });
+                carryOver.push({ ...ps, retryCount: ps.retryCount+1, totalLost: (ps.totalLost||0)+ps.betAmt, nextIssue });
             }
         }
 
+        // ── Evaluate new signals ──────────────────────────────────────────────
         const newSigs = evaluateSignals();
-        newSigs.forEach(s=>console.log(`  [sim][NEW⭐⭐] ${s.label} ${s.side}连${s.len}→${s.chase} ${s.pct}%`));
+        newSigs.forEach(s=>console.log(`  [NEW⭐⭐] ${s.label} ${s.side}连${s.len}→${s.chase} ${s.pct}%`));
 
         const seen   = new Set(carryOver.map(s=>`${s.dimId}|${s.side}|${s.len}`));
         const merged = [...carryOver];
         for (const sig of newSigs) {
             const key = `${sig.dimId}|${sig.side}|${sig.len}`;
             if (!seen.has(key)) {
-                merged.push({ ...sig, retryCount:0, nextIssue });
+                merged.push({ ...sig, retryCount:0, totalLost:0, nextIssue });
                 seen.add(key);
             }
         }
 
         merged.sort((a,b)=>b.retryCount-a.retryCount||b.pct-a.pct||b.n-a.n);
 
+        // Assign bet amounts for next round
         const bettedSignals = assignBets(merged);
+
+        // Store betAmt onto pendingSignals for verification next draw
         db.pendingSignals = bettedSignals.map(s=>({ ...s, nextIssue }));
 
         if (!bettedSignals.length && !verResults.length) {
-            console.log('  [sim] no signals');
+            console.log('  [silent] no signals');
         }
 
         if (verResults.length>0 || bettedSignals.length>0) {
@@ -344,7 +357,7 @@ async function poll() {
         }
 
     } else {
-        process.stdout.write(`\r[sim] 期${raw.preDrawIssue} → 下期${nextIssue} ${Math.ceil(secsToNext()??0)}s  bal:${fmt(db.balance)}  `);
+        process.stdout.write(`\r[poll] 期${raw.preDrawIssue} → 下期${nextIssue} ${Math.ceil(secsToNext()??0)}s  bal:${fmt(db.balance)}  `);
     }
 
     setTimeout(poll,nextMs);
@@ -356,7 +369,7 @@ async function poll() {
     console.log(`   Chat: ${CHAT_ID}  Threshold: ≥${HIGHLIGHT}%  Starting: ${STARTING_BALANCE}`);
     console.log(`   Ladder: ${BET_LADDER.join(' → ')}  Split from: index ${SPLIT_FROM} (${BET_LADDER[SPLIT_FROM]})`);
     console.log('');
-    try{await init();}catch(e){console.error('[sim][init error]',e.message);process.exit(1);}
+    try{await init();}catch(e){console.error('[init error]',e.message);process.exit(1);}
     send([
         `🎰 *Dragon Sim Bot 已启动*`,
         `💰 起始余额: *${STARTING_BALANCE}*`,
