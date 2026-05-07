@@ -10,7 +10,7 @@ const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
 const HIGHLIGHT = 70; // ⭐⭐ threshold
-const MIN_N     = 4;
+const MIN_N     = 6;
 const CHECKS    = [2, 3, 4, 5, 6, 7];
 
 const posLabels = ['冠军','亚军','第三','第四','第五','第六','第七','第八','第九','第十'];

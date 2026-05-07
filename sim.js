@@ -3,19 +3,19 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const axios       = require('axios');
 
-const BOT_TOKEN = process.env.SIM_BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
-const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_CHAT_ID_HERE';
+const BOT_TOKEN = process.env.SIM_BOT_TOKEN || 'YOUR_SIM_BOT_TOKEN_HERE';
+const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_SIM_CHAT_ID_HERE';
 
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
 const HIGHLIGHT = 70;
-const MIN_N     = 4;
+const MIN_N     = 6;
 const CHECKS    = [2, 3, 4, 5, 6, 7];
 
 // Martingale ladder — index = retryCount (0=fresh bet)
-const BET_LADDER = [22, 25, 52, 110, 230, 483, 922];
-// From index 4 (483) onwards, split equally across all active signals
+const BET_LADDER = [33, 38, 79, 167, 349, 733, 1400];
+// From index 4 (349) onwards, split equally across all active signals
 const SPLIT_FROM  = 4;
 
 const STARTING_BALANCE = 2000;
@@ -137,7 +137,7 @@ function evaluateSignals() {
 }
 
 // ── Bet sizing ────────────────────────────────────────────────────────────────
-// Normal tier: standard ladder per signal
+// Normal tier: pick ONLY the best signal (highest pct, tiebreak by n)
 // High tier (483+): sum of all losses * 1.1, split equally among high tier signals
 function assignBets(signals) {
     if (signals.length === 0) return [];
@@ -146,17 +146,18 @@ function assignBets(signals) {
     const high    = signals.filter(s => s.retryCount >= SPLIT_FROM);
     const result  = [];
 
-    // Normal tier — each bets its own ladder amount
-    for (const sig of normal) {
-        const amt = BET_LADDER[Math.min(sig.retryCount, BET_LADDER.length-1)];
-        result.push({ ...sig, betAmt: amt });
+    // Normal tier — pick only the single best signal
+    if (normal.length > 0) {
+        const best = normal.slice().sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
+        const amt  = BET_LADDER[Math.min(best.retryCount, BET_LADDER.length-1)];
+        result.push({ ...best, betAmt: amt });
     }
 
     // High tier — sum of all their losses * 1.1, split equally
     if (high.length > 0) {
-        const sumLost    = high.reduce((sum, s) => sum + (s.totalLost || 0), 0);
+        const sumLost     = high.reduce((sum, s) => sum + (s.totalLost || 0), 0);
         const totalNeeded = Math.max(sumLost * 1.1, BET_LADDER[SPLIT_FROM]);
-        const perSig     = Math.ceil(totalNeeded / high.length);
+        const perSig      = Math.ceil(totalNeeded / high.length);
         for (const sig of high) {
             result.push({ ...sig, betAmt: perSig });
         }
