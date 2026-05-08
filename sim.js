@@ -9,18 +9,14 @@ const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_SIM_CHAT_ID_HERE';
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
-const HIGHLIGHT = 70;
-const MIN_N     = 7;
-const CHECKS    = [2, 3, 4, 5, 6, 7];
-
+const HIGHLIGHT        = 70;
+const MIN_N            = 7;
+const CHECKS           = [2, 3, 4, 5, 6, 7];
 const BET_LADDER       = [33, 38, 79, 167, 349, 733, 1400];
-const SPLIT_FROM       = 4;
+const SPLIT_FROM       = 3;
 const STARTING_BALANCE = 2000;
-const HARD_CAP_LOSS    = 2000;  // stop forever if balance hits 0
-const STOPLOSS_DROP    = 400;   // pause if balance drops 400 from peak
-const STOPLOSS_PAUSE   = 10;    // draws to pause after stop-loss
-const COOLDOWN_LOSSES  = 4;     // consecutive losses before signal cooldown
-const COOLDOWN_DRAWS   = 5;     // draws to cool down
+const HARD_CAP_LOSS    = 2000; // stop forever if balance hits 0
+const RECOVERY_AFTER   = 4;    // consecutive losses before recovery mode
 
 const posLabels = ['冠军','亚军','第三','第四','第五','第六','第七','第八','第九','第十'];
 
@@ -111,7 +107,6 @@ const db = {
     shownStart    : false,
     shownLast     : false,
     pendingSignals: [],
-    // Sim state
     balance       : STARTING_BALANCE,
     totalBet      : 0,
     totalWin      : 0,
@@ -119,10 +114,7 @@ const db = {
     drawsPlayed   : 0,
     peakBalance   : STARTING_BALANCE,
     troughBalance : STARTING_BALANCE,
-    // Risk management
     busted        : false,
-    pauseRemaining: 0,
-    cooldowns     : {}, // key -> draws remaining
 };
 
 function evaluateSignals() {
@@ -131,7 +123,6 @@ function evaluateSignals() {
     for (const sig of db.signalTable) {
         const key = `${sig.dimId}|${sig.side}|${sig.len}`;
         if (seen.has(key)) continue;
-        if (db.cooldowns[key] > 0) continue; // skip cooled down signals
         const dim = db.dims.find(d=>d.id===sig.dimId);
         if (!dim) continue;
         if (!matchesStreak(db.rawHistory, dim.fn, sig.side, sig.len)) continue;
@@ -141,16 +132,40 @@ function evaluateSignals() {
     return active;
 }
 
+// Assign bets — normal ladder or recovery mode
+// Recovery mode: after RECOVERY_AFTER consecutive losses,
+// calculate exact amount needed to recover to peak, split across all signals
 function assignBets(signals) {
     if (signals.length === 0) return [];
-    const normal  = signals.filter(s => s.retryCount < SPLIT_FROM);
-    const high    = signals.filter(s => s.retryCount >= SPLIT_FROM);
-    const result  = [];
+
+    const normal   = signals.filter(s => s.retryCount < SPLIT_FROM);
+    const high     = signals.filter(s => s.retryCount >= SPLIT_FROM);
+    const inRecovery = signals.some(s => (s.consecutiveLoss || 0) >= RECOVERY_AFTER);
+
+    if (inRecovery) {
+        // Recovery mode — need to win back to peak across all signals
+        // Each signal pays 1:1 (96%), so winning one bet of X returns X*0.96 net
+        // Total needed = peakBalance - balance
+        // Split across all signals: each needs to cover their share
+        const deficit    = db.peakBalance - db.balance;
+        const pool       = signals; // all signals join recovery
+        // To recover deficit across pool: each bet = ceil(deficit / pool.length / 0.96)
+        const perSig     = Math.ceil((deficit / pool.length) / 0.96);
+        const result     = [];
+        for (const sig of pool) {
+            result.push({ ...sig, betAmt: perSig, recoveryMode: true });
+        }
+        return result;
+    }
+
+    const result = [];
     if (high.length === 0) {
+        // Normal tier — single best signal
         const best = normal.slice().sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
         const amt  = BET_LADDER[Math.min(best.retryCount, BET_LADDER.length-1)];
         result.push({ ...best, betAmt: amt });
     } else {
+        // High tier active — pool everyone, split losses*1.1
         const pool        = [...high, ...normal];
         const sumLost     = high.reduce((sum, s) => sum + (s.totalLost || 0), 0);
         const totalNeeded = Math.max(sumLost * 1.1, BET_LADDER[SPLIT_FROM]);
@@ -160,33 +175,6 @@ function assignBets(signals) {
         }
     }
     return result;
-}
-
-function tickCooldowns() {
-    for (const key of Object.keys(db.cooldowns)) {
-        db.cooldowns[key]--;
-        if (db.cooldowns[key] <= 0) {
-            delete db.cooldowns[key];
-            console.log(`  [cooldown] ${key} 冷却结束，重新开放`);
-        }
-    }
-}
-
-function checkStopLoss() {
-    // Hard cap — bust
-    if (db.balance <= STARTING_BALANCE - HARD_CAP_LOSS) {
-        db.busted = true;
-        db.pendingSignals = [];
-        return 'busted';
-    }
-    // Drawdown stop-loss
-    const drawdown = db.peakBalance - db.balance;
-    if (drawdown >= STOPLOSS_DROP && db.pauseRemaining === 0) {
-        db.pauseRemaining = STOPLOSS_PAUSE;
-        db.pendingSignals = [];
-        return 'paused';
-    }
-    return 'ok';
 }
 
 function secsToNext() {
@@ -202,7 +190,7 @@ function send(text) {
               .catch(err=>console.error('[send error]',err.message));
 }
 
-function buildMsg(raw, bettedSignals, verResults, nextIssue, statusMsg) {
+function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     const nums  = raw.preDrawCode.split(',').map(Number);
     const time  = raw.preDrawTime.slice(11,19);
     const s     = secsToNext();
@@ -232,29 +220,28 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue, statusMsg) {
     lines.push(`💰 余额: *${fmt(db.balance)}* | 峰值: ${fmt(db.peakBalance)} | 谷值: ${fmt(db.troughBalance)}`);
     lines.push(`📈 总投: ${fmt(db.totalBet)} | 赢: +${fmt(db.totalWin)} | 输: -${fmt(db.totalLoss)} | 净: ${db.totalWin-db.totalLoss>=0?'+':''}${fmt(db.totalWin-db.totalLoss)}`);
 
-    if (statusMsg) {
-        lines.push('');
-        lines.push(statusMsg);
-    }
-
     lines.push('');
     lines.push(`\`─────────────────────────\``);
     lines.push(`📌 下批 *#${nextIssue}* 下注:`);
     lines.push('');
 
     if (db.busted) {
-        lines.push(`🛑 *爆仓！余额归零，已停止下注*`);
-    } else if (db.pauseRemaining > 0) {
-        lines.push(`⏸ *止损暂停中，剩余 ${db.pauseRemaining} 期后恢复*`);
+        lines.push(`🛑 *爆仓！余额归零，已永久停止*`);
     } else if (bettedSignals.length === 0) {
         lines.push('_暂无⭐⭐信号_');
     } else {
-        const totalNextBet = bettedSignals.reduce((sum,s)=>sum+s.betAmt,0);
-        const highCount    = bettedSignals.filter(s=>s.retryCount>=SPLIT_FROM).length;
-        if (highCount > 1) {
+        const totalNextBet  = bettedSignals.reduce((sum,s)=>sum+s.betAmt,0);
+        const isRecovery    = bettedSignals.some(s=>s.recoveryMode);
+        const highCount     = bettedSignals.filter(s=>s.retryCount>=SPLIT_FROM).length;
+
+        if (isRecovery) {
+            lines.push(`🔄 *回本模式* — 目标峰值: ${fmt(db.peakBalance)}`);
+            lines.push('');
+        } else if (highCount > 1) {
             lines.push(`⚠️ _高级信号 ×${highCount}，均摊下注_`);
             lines.push('');
         }
+
         lines.push(`⭐⭐  总注: *${fmt(totalNextBet)}*`);
         lines.push('');
         for (const sig of bettedSignals) {
@@ -320,31 +307,14 @@ async function poll() {
         db.rawHistory.push(raw);
         if (db.rawHistory.length>1000) db.rawHistory.shift();
 
-        // Tick cooldowns
-        tickCooldowns();
-
-        // Tick pause
-        if (db.pauseRemaining > 0) {
-            db.pauseRemaining--;
-            console.log(`  [paused] 剩余 ${db.pauseRemaining} 期`);
-            if (db.pauseRemaining === 0) {
-                console.log('  [resumed] 止损结束，恢复下注');
-                send(`▶️ *止损结束，恢复下注*\n💰 余额: *${fmt(db.balance)}*`);
-            }
-            setTimeout(poll,nextMs);
-            return;
-        }
-
         if (db.busted) {
             console.log('  [busted] 已爆仓，停止');
             setTimeout(poll,nextMs);
             return;
         }
 
-        // Verify pending signals
         const verResults = [];
         const carryOver  = [];
-        let statusMsg    = null;
 
         for (const ps of db.pendingSignals) {
             if (ps.nextIssue !== raw.preDrawIssue) continue;
@@ -367,33 +337,26 @@ async function poll() {
             verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, actual, hit, betAmt:ps.betAmt });
             console.log(`  [${hit?'HIT':'MISS'}] ${ps.label} 杀${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)}`);
 
-            if (!hit) {
+            // Hard cap check
+            if (db.balance <= STARTING_BALANCE - HARD_CAP_LOSS) {
+                db.busted = true;
+                console.log('  [BUSTED] 爆仓！');
+            }
+
+            if (!hit && !db.busted) {
                 const consecutiveLoss = (ps.consecutiveLoss || 0) + 1;
-                const sigKey = `${ps.dimId}|${ps.side}|${ps.len}`;
-                if (consecutiveLoss >= COOLDOWN_LOSSES || ps.retryCount+1 >= BET_LADDER.length) {
-                    // Put signal on cooldown
-                    db.cooldowns[sigKey] = COOLDOWN_DRAWS;
-                    console.log(`  [cooldown] ${sigKey} 冷却 ${COOLDOWN_DRAWS} 期`);
-                    statusMsg = `🧊 _信号冷却: ${ps.label} 连败${consecutiveLoss}次，休息${COOLDOWN_DRAWS}期_`;
-                } else {
-                    carryOver.push({ ...ps, retryCount: ps.retryCount+1, totalLost: (ps.totalLost||0)+ps.betAmt, consecutiveLoss, nextIssue });
-                }
+                carryOver.push({
+                    ...ps,
+                    retryCount: ps.retryCount+1,
+                    totalLost: (ps.totalLost||0)+ps.betAmt,
+                    consecutiveLoss,
+                    nextIssue
+                });
             }
         }
 
-        // Check stop-loss / bust after P&L
-        const riskStatus = checkStopLoss();
-        if (riskStatus === 'busted') {
-            console.log('  [BUSTED] 爆仓！');
-            statusMsg = `🛑 *爆仓！余额归零，永久停止*`;
-            send(buildMsg(raw, [], verResults, nextIssue, statusMsg));
-            setTimeout(poll,nextMs);
-            return;
-        }
-        if (riskStatus === 'paused') {
-            console.log(`  [STOPLOSS] 止损触发，暂停 ${STOPLOSS_PAUSE} 期`);
-            statusMsg = `⏸ *止损触发！暂停 ${STOPLOSS_PAUSE} 期* (回撤 ${fmt(db.peakBalance-db.balance)})`;
-            send(buildMsg(raw, [], verResults, nextIssue, statusMsg));
+        if (db.busted) {
+            send(buildMsg(raw, [], verResults, nextIssue));
             setTimeout(poll,nextMs);
             return;
         }
@@ -421,8 +384,8 @@ async function poll() {
             console.log('  [silent] no signals');
         }
 
-        if (verResults.length>0 || bettedSignals.length>0 || statusMsg) {
-            send(buildMsg(raw, bettedSignals, verResults, nextIssue, statusMsg));
+        if (verResults.length>0 || bettedSignals.length>0) {
+            send(buildMsg(raw, bettedSignals, verResults, nextIssue));
         }
 
     } else {
@@ -436,15 +399,14 @@ async function poll() {
     console.log('Dragon Sim Bot');
     console.log(`   Chat: ${CHAT_ID}  Threshold: >=${HIGHLIGHT}%  Starting: ${STARTING_BALANCE}`);
     console.log(`   Ladder: ${BET_LADDER.join(' > ')}  Split from: index ${SPLIT_FROM} (${BET_LADDER[SPLIT_FROM]})`);
-    console.log(`   StopLoss: -${STOPLOSS_DROP} pause:${STOPLOSS_PAUSE}  Cooldown: ${COOLDOWN_LOSSES}x/${COOLDOWN_DRAWS}draws  HardCap: -${HARD_CAP_LOSS}`);
+    console.log(`   Recovery after: ${RECOVERY_AFTER} losses  HardCap: -${HARD_CAP_LOSS}`);
     console.log('');
     try{await init();}catch(e){console.error('[init error]',e.message);process.exit(1);}
     send([
         `*Dragon Sim Bot 已启动*`,
         `起始余额: *${STARTING_BALANCE}*`,
         `梯注: ${BET_LADDER.join(' > ')}`,
-        `止损: -${STOPLOSS_DROP} 暂停${STOPLOSS_PAUSE}期`,
-        `冷却: 连败${COOLDOWN_LOSSES}次 → 休息${COOLDOWN_DRAWS}期`,
+        `连败${RECOVERY_AFTER}次 → 回本模式`,
         `硬顶: 亏损${HARD_CAP_LOSS}永久停止`,
     ].join('\n'));
     poll();
