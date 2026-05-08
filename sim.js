@@ -12,7 +12,7 @@ const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=
 const HIGHLIGHT        = 70;
 const MIN_N            = 4;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
-const BET_LADDER       = [11, 23, 48, 101, 212, 445, 935];
+const BET_LADDER       = [11, 21, 40, 76, 144];
 const SPLIT_FROM       = 3;
 const STARTING_BALANCE = 2000;
 const HARD_CAP_LOSS    = 2000; // stop forever if balance hits 0
