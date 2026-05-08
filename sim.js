@@ -13,10 +13,14 @@ const HIGHLIGHT = 70;
 const MIN_N     = 7;
 const CHECKS    = [2, 3, 4, 5, 6, 7];
 
-const BET_LADDER = [33, 38, 79, 167, 349, 733, 1400];
-const SPLIT_FROM = 4;
-
+const BET_LADDER       = [33, 38, 79, 167, 349, 733, 1400];
+const SPLIT_FROM       = 4;
 const STARTING_BALANCE = 2000;
+const HARD_CAP_LOSS    = 2000;  // stop forever if balance hits 0
+const STOPLOSS_DROP    = 400;   // pause if balance drops 400 from peak
+const STOPLOSS_PAUSE   = 10;    // draws to pause after stop-loss
+const COOLDOWN_LOSSES  = 4;     // consecutive losses before signal cooldown
+const COOLDOWN_DRAWS   = 5;     // draws to cool down
 
 const posLabels = ['冠军','亚军','第三','第四','第五','第六','第七','第八','第九','第十'];
 
@@ -107,6 +111,7 @@ const db = {
     shownStart    : false,
     shownLast     : false,
     pendingSignals: [],
+    // Sim state
     balance       : STARTING_BALANCE,
     totalBet      : 0,
     totalWin      : 0,
@@ -114,6 +119,10 @@ const db = {
     drawsPlayed   : 0,
     peakBalance   : STARTING_BALANCE,
     troughBalance : STARTING_BALANCE,
+    // Risk management
+    busted        : false,
+    pauseRemaining: 0,
+    cooldowns     : {}, // key -> draws remaining
 };
 
 function evaluateSignals() {
@@ -122,6 +131,7 @@ function evaluateSignals() {
     for (const sig of db.signalTable) {
         const key = `${sig.dimId}|${sig.side}|${sig.len}`;
         if (seen.has(key)) continue;
+        if (db.cooldowns[key] > 0) continue; // skip cooled down signals
         const dim = db.dims.find(d=>d.id===sig.dimId);
         if (!dim) continue;
         if (!matchesStreak(db.rawHistory, dim.fn, sig.side, sig.len)) continue;
@@ -152,6 +162,33 @@ function assignBets(signals) {
     return result;
 }
 
+function tickCooldowns() {
+    for (const key of Object.keys(db.cooldowns)) {
+        db.cooldowns[key]--;
+        if (db.cooldowns[key] <= 0) {
+            delete db.cooldowns[key];
+            console.log(`  [cooldown] ${key} 冷却结束，重新开放`);
+        }
+    }
+}
+
+function checkStopLoss() {
+    // Hard cap — bust
+    if (db.balance <= STARTING_BALANCE - HARD_CAP_LOSS) {
+        db.busted = true;
+        db.pendingSignals = [];
+        return 'busted';
+    }
+    // Drawdown stop-loss
+    const drawdown = db.peakBalance - db.balance;
+    if (drawdown >= STOPLOSS_DROP && db.pauseRemaining === 0) {
+        db.pauseRemaining = STOPLOSS_PAUSE;
+        db.pendingSignals = [];
+        return 'paused';
+    }
+    return 'ok';
+}
+
 function secsToNext() {
     if (!db.nextDrawAt) return null;
     return Math.max(0,(db.nextDrawAt-Date.now())/1000);
@@ -165,7 +202,7 @@ function send(text) {
               .catch(err=>console.error('[send error]',err.message));
 }
 
-function buildMsg(raw, bettedSignals, verResults, nextIssue) {
+function buildMsg(raw, bettedSignals, verResults, nextIssue, statusMsg) {
     const nums  = raw.preDrawCode.split(',').map(Number);
     const time  = raw.preDrawTime.slice(11,19);
     const s     = secsToNext();
@@ -195,12 +232,21 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     lines.push(`💰 余额: *${fmt(db.balance)}* | 峰值: ${fmt(db.peakBalance)} | 谷值: ${fmt(db.troughBalance)}`);
     lines.push(`📈 总投: ${fmt(db.totalBet)} | 赢: +${fmt(db.totalWin)} | 输: -${fmt(db.totalLoss)} | 净: ${db.totalWin-db.totalLoss>=0?'+':''}${fmt(db.totalWin-db.totalLoss)}`);
 
+    if (statusMsg) {
+        lines.push('');
+        lines.push(statusMsg);
+    }
+
     lines.push('');
     lines.push(`\`─────────────────────────\``);
     lines.push(`📌 下批 *#${nextIssue}* 下注:`);
     lines.push('');
 
-    if (bettedSignals.length === 0) {
+    if (db.busted) {
+        lines.push(`🛑 *爆仓！余额归零，已停止下注*`);
+    } else if (db.pauseRemaining > 0) {
+        lines.push(`⏸ *止损暂停中，剩余 ${db.pauseRemaining} 期后恢复*`);
+    } else if (bettedSignals.length === 0) {
         lines.push('_暂无⭐⭐信号_');
     } else {
         const totalNextBet = bettedSignals.reduce((sum,s)=>sum+s.betAmt,0);
@@ -274,8 +320,31 @@ async function poll() {
         db.rawHistory.push(raw);
         if (db.rawHistory.length>1000) db.rawHistory.shift();
 
+        // Tick cooldowns
+        tickCooldowns();
+
+        // Tick pause
+        if (db.pauseRemaining > 0) {
+            db.pauseRemaining--;
+            console.log(`  [paused] 剩余 ${db.pauseRemaining} 期`);
+            if (db.pauseRemaining === 0) {
+                console.log('  [resumed] 止损结束，恢复下注');
+                send(`▶️ *止损结束，恢复下注*\n💰 余额: *${fmt(db.balance)}*`);
+            }
+            setTimeout(poll,nextMs);
+            return;
+        }
+
+        if (db.busted) {
+            console.log('  [busted] 已爆仓，停止');
+            setTimeout(poll,nextMs);
+            return;
+        }
+
+        // Verify pending signals
         const verResults = [];
         const carryOver  = [];
+        let statusMsg    = null;
 
         for (const ps of db.pendingSignals) {
             if (ps.nextIssue !== raw.preDrawIssue) continue;
@@ -284,8 +353,8 @@ async function poll() {
             const hit    = actual===ps.chase;
 
             if (hit) {
-                db.balance   += ps.betAmt;
-                db.totalWin  += ps.betAmt;
+                db.balance  += ps.betAmt;
+                db.totalWin += ps.betAmt;
             } else {
                 db.balance   -= ps.betAmt;
                 db.totalLoss += ps.betAmt;
@@ -299,10 +368,37 @@ async function poll() {
             console.log(`  [${hit?'HIT':'MISS'}] ${ps.label} 杀${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)}`);
 
             if (!hit) {
-                carryOver.push({ ...ps, retryCount: ps.retryCount+1, totalLost: (ps.totalLost||0)+ps.betAmt, nextIssue });
+                const consecutiveLoss = (ps.consecutiveLoss || 0) + 1;
+                const sigKey = `${ps.dimId}|${ps.side}|${ps.len}`;
+                if (consecutiveLoss >= COOLDOWN_LOSSES || ps.retryCount+1 >= BET_LADDER.length) {
+                    // Put signal on cooldown
+                    db.cooldowns[sigKey] = COOLDOWN_DRAWS;
+                    console.log(`  [cooldown] ${sigKey} 冷却 ${COOLDOWN_DRAWS} 期`);
+                    statusMsg = `🧊 _信号冷却: ${ps.label} 连败${consecutiveLoss}次，休息${COOLDOWN_DRAWS}期_`;
+                } else {
+                    carryOver.push({ ...ps, retryCount: ps.retryCount+1, totalLost: (ps.totalLost||0)+ps.betAmt, consecutiveLoss, nextIssue });
+                }
             }
         }
 
+        // Check stop-loss / bust after P&L
+        const riskStatus = checkStopLoss();
+        if (riskStatus === 'busted') {
+            console.log('  [BUSTED] 爆仓！');
+            statusMsg = `🛑 *爆仓！余额归零，永久停止*`;
+            send(buildMsg(raw, [], verResults, nextIssue, statusMsg));
+            setTimeout(poll,nextMs);
+            return;
+        }
+        if (riskStatus === 'paused') {
+            console.log(`  [STOPLOSS] 止损触发，暂停 ${STOPLOSS_PAUSE} 期`);
+            statusMsg = `⏸ *止损触发！暂停 ${STOPLOSS_PAUSE} 期* (回撤 ${fmt(db.peakBalance-db.balance)})`;
+            send(buildMsg(raw, [], verResults, nextIssue, statusMsg));
+            setTimeout(poll,nextMs);
+            return;
+        }
+
+        // Evaluate new signals
         const newSigs = evaluateSignals();
         newSigs.forEach(s=>console.log(`  [NEW] ${s.label} ${s.side}连${s.len}→${s.chase} ${s.pct}%`));
 
@@ -311,7 +407,7 @@ async function poll() {
         for (const sig of newSigs) {
             const key = `${sig.dimId}|${sig.side}|${sig.len}`;
             if (!seen.has(key)) {
-                merged.push({ ...sig, retryCount:0, totalLost:0, nextIssue });
+                merged.push({ ...sig, retryCount:0, totalLost:0, consecutiveLoss:0, nextIssue });
                 seen.add(key);
             }
         }
@@ -325,8 +421,8 @@ async function poll() {
             console.log('  [silent] no signals');
         }
 
-        if (verResults.length>0 || bettedSignals.length>0) {
-            send(buildMsg(raw, bettedSignals, verResults, nextIssue));
+        if (verResults.length>0 || bettedSignals.length>0 || statusMsg) {
+            send(buildMsg(raw, bettedSignals, verResults, nextIssue, statusMsg));
         }
 
     } else {
@@ -340,14 +436,16 @@ async function poll() {
     console.log('Dragon Sim Bot');
     console.log(`   Chat: ${CHAT_ID}  Threshold: >=${HIGHLIGHT}%  Starting: ${STARTING_BALANCE}`);
     console.log(`   Ladder: ${BET_LADDER.join(' > ')}  Split from: index ${SPLIT_FROM} (${BET_LADDER[SPLIT_FROM]})`);
+    console.log(`   StopLoss: -${STOPLOSS_DROP} pause:${STOPLOSS_PAUSE}  Cooldown: ${COOLDOWN_LOSSES}x/${COOLDOWN_DRAWS}draws  HardCap: -${HARD_CAP_LOSS}`);
     console.log('');
     try{await init();}catch(e){console.error('[init error]',e.message);process.exit(1);}
     send([
         `*Dragon Sim Bot 已启动*`,
         `起始余额: *${STARTING_BALANCE}*`,
         `梯注: ${BET_LADDER.join(' > ')}`,
-        `${BET_LADDER[SPLIT_FROM]}+ 多信号均摊`,
-        `杀 信号 (>=${HIGHLIGHT}%)`,
+        `止损: -${STOPLOSS_DROP} 暂停${STOPLOSS_PAUSE}期`,
+        `冷却: 连败${COOLDOWN_LOSSES}次 → 休息${COOLDOWN_DRAWS}期`,
+        `硬顶: 亏损${HARD_CAP_LOSS}永久停止`,
     ].join('\n'));
     poll();
 })();
