@@ -11,7 +11,7 @@ const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=
 
 const HIGHLIGHT        = 60;
 const MIN_N            = 7;
-const CHECKS           = [4, 5, 6, 7];
+const CHECKS           = [2, 3, 4, 5, 6, 7];
 const BET_LADDER       = [33, 38, 79, 167, 349, 733, 1400];
 const SPLIT_FROM       = 3;
 const STARTING_BALANCE = 2000;
@@ -39,7 +39,7 @@ function buildDimensions() {
             id:`dt${i+1}`, label:`第${i+1}名 龙虎`,
             fn: r => {
                 const nums = r.preDrawCode.split(',').map(Number);
-                return nums[pos] < nums[9-pos] ? '龙' : '虎';
+                return nums[pos] > nums[9-pos] ? '龙' : '虎';
             }
         });
     }
