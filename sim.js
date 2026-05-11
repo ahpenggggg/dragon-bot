@@ -9,7 +9,7 @@ const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_SIM_CHAT_ID_HERE';
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
-const HIGHLIGHT        = 60;
+const HIGHLIGHT        = 70;
 const MIN_N            = 7;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
 const PAROLI_BASE      = 33;   // base bet per cycle
@@ -133,17 +133,16 @@ function evaluateSignals() {
     return active;
 }
 
-// Paroli: bet = PAROLI_BASE * 2^consecutiveWins
-// Reset after any loss or after reaching PAROLI_TARGET consecutive wins
+// Paroli: one active cycle at a time (highest wins first, then pct), bet = BASE * 2^wins
 function assignBets(signals) {
     if (signals.length === 0) return [];
-    const result = [];
-    for (const sig of signals) {
-        const wins   = sig.consecutiveWins || 0;
-        const betAmt = PAROLI_BASE * Math.pow(2, wins);
-        result.push({ ...sig, betAmt });
-    }
-    return result;
+    const inCycle = signals.filter(s => (s.consecutiveWins || 0) > 0)
+                           .sort((a,b) => b.consecutiveWins - a.consecutiveWins || b.pct - a.pct);
+    const fresh   = signals.filter(s => (s.consecutiveWins || 0) === 0)
+                           .sort((a,b) => b.pct - a.pct);
+    const chosen  = inCycle.length > 0 ? inCycle[0] : fresh[0];
+    const wins    = chosen.consecutiveWins || 0;
+    return [{ ...chosen, betAmt: PAROLI_BASE * Math.pow(2, wins) }];
 }
 
 function secsToNext() {
