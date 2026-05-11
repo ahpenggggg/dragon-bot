@@ -122,7 +122,7 @@ function evaluateSignals() {
     const active = [];
     const seen   = new Set();
     for (const sig of db.signalTable) {
-        const key = `${sig.dimId}|${sig.side}|${sig.len}`;
+        const key = `${sig.dimId}|${sig.side}|${sig.len}|${sig.action}`;
         if (seen.has(key)) continue;
         const dim = db.dims.find(d=>d.id===sig.dimId);
         if (!dim) continue;
@@ -272,6 +272,11 @@ async function poll() {
 
         db.rawHistory.push(raw);
         if (db.rawHistory.length>1000) db.rawHistory.shift();
+
+        if (db.drawCount % 25 === 0) {
+            db.signalTable = buildSignalTable(db.rawHistory);
+            console.log(`  [REBUILD] 信号表已刷新 (第${db.drawCount}期): ${db.signalTable.length} 条`);
+        }
 
         if (db.busted) {
             console.log('  [busted] 已爆仓，停止');
