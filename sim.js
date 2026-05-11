@@ -10,18 +10,19 @@ const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
 const HIGHLIGHT        = 55;
-const MIN_N            = 7;
+const MIN_N            = 5;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
 const BET_LADDER       = [33, 38, 79, 167, 349, 733, 1400];
-const SPLIT_FROM       = 3;    // split from 167 onwards
-const RECOVERY_AFTER   = 4;    // consecutive losses → recovery mode
-const PAROLI_MULT      = 1.7;  // win multiplier
-const PAROLI_CAP       = 3;    // max consecutive wins before reset
+const SPLIT_FROM       = 3;
+const RECOVERY_AFTER   = 4;
+const PAROLI_MULT      = 1.7;
+const PAROLI_CAP       = 3;
 const STARTING_BALANCE = 2000;
 const HARD_CAP_LOSS    = 2000;
 const DAILY_GROWTH     = 0.30;
-const RESUME_HOUR_MYT  = 14;   // 2pm MYT
-const REBUILD_EVERY    = 25;   // redraw signal table every N draws
+const RESUME_HOUR_MYT  = 14;
+const REBUILD_EVERY    = 25;
+const PAYOUT_RATE      = 0.96;
 
 const posLabels = ['冠军','亚军','第三','第四','第五','第六','第七','第八','第九','第十'];
 
@@ -59,14 +60,15 @@ function countStreakFollowup(vals, streakLen) {
         if (!w.every(v=>v===side)) continue;
         const before = vals[i-streakLen-1];
         if (before === side) continue;
-        const broke = vals[i]!==side;
-        if (!res.bySide[side]) res.bySide[side]={break:0,total:0};
+        const cont = vals[i]===side;
+        if (!res.bySide[side]) res.bySide[side]={continue:0,break:0,total:0};
         res.bySide[side].total++;
-        if (broke) res.bySide[side].break++;
+        cont ? res.bySide[side].continue++ : res.bySide[side].break++;
     }
     return res;
 }
 
+// Build signal table for both break (杀) and continue (追)
 function buildSignalTable(rawRecords) {
     const dims = buildDimensions();
     const sigs = [];
@@ -76,15 +78,23 @@ function buildSignalTable(rawRecords) {
             const res = countStreakFollowup(vals, len);
             for (const [side, s] of Object.entries(res.bySide)) {
                 if (s.total < MIN_N) continue;
-                const pair = dim.id.includes('DS')?['单','双']:dim.id.startsWith('dt')?['龙','虎']:['大','小'];
-                const opp  = pair.find(x=>x!==side);
-                const bPct = Math.round(s.break/s.total*100);
+                const pair  = dim.id.includes('DS')?['单','双']:dim.id.startsWith('dt')?['龙','虎']:['大','小'];
+                const opp   = pair.find(x=>x!==side);
+                const bPct  = Math.round(s.break/s.total*100);
+                const cPct  = Math.round(s.continue/s.total*100);
+
+                // Break signal (杀) — bet opposite
                 if (bPct >= HIGHLIGHT) {
                     sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'杀', chase:opp, pct:bPct, n:s.total });
+                }
+                // Continue signal (追) — bet same side
+                if (cPct >= HIGHLIGHT) {
+                    sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'追', chase:side, pct:cPct, n:s.total });
                 }
             }
         }
     }
+    // Sort by pct desc — highest probability first regardless of action type
     sigs.sort((a,b)=>b.pct-a.pct||b.n-a.n);
     return sigs;
 }
@@ -132,7 +142,7 @@ function evaluateSignals() {
     const active = [];
     const seen   = new Set();
     for (const sig of db.signalTable) {
-        const key = `${sig.dimId}|${sig.side}|${sig.len}`;
+        const key = `${sig.dimId}|${sig.side}|${sig.len}|${sig.action}`;
         if (seen.has(key)) continue;
         const dim = db.dims.find(d=>d.id===sig.dimId);
         if (!dim) continue;
@@ -146,19 +156,21 @@ function evaluateSignals() {
 function nextResume() {
     const now    = new Date();
     const resume = new Date(now);
-    resume.setUTCHours(RESUME_HOUR_MYT - 8, 0, 0, 0); // 2pm MYT = 6am UTC
-    if (now >= resume) resume.setUTCDate(resume.getUTCDate() + 1);
+    resume.setUTCHours(RESUME_HOUR_MYT-8, 0, 0, 0);
+    if (now >= resume) resume.setUTCDate(resume.getUTCDate()+1);
     return resume;
 }
 
-// Bet sizing: Paroli on wins, martingale on losses, recovery after 4 losses, split from 167
+function isInProfit() {
+    return db.balance > db.dayStart;
+}
+
 function assignBets(signals) {
     if (signals.length === 0) return [];
 
-    const inRecovery = signals.some(s => (s.consecutiveLoss || 0) >= RECOVERY_AFTER);
+    const inRecovery = signals.some(s => (s.consecutiveLoss||0) >= RECOVERY_AFTER);
 
     if (inRecovery) {
-        // Recovery: exact deficit split across all signals
         const deficit = db.peakBalance - db.balance;
         const pool    = signals;
         const perSig  = Math.ceil((deficit / pool.length) / PAYOUT_RATE);
@@ -170,34 +182,33 @@ function assignBets(signals) {
     const result = [];
 
     if (high.length === 0) {
-        // Single best signal
+        // Single best signal by pct
         const best = normal.slice().sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
         let amt;
-        if ((best.consecutiveWin || 0) > 0 && (best.consecutiveWin || 0) < PAROLI_CAP) {
-            // Paroli: last win profit * 1.7
+        // Paroli only if in profit
+        if (isInProfit() && (best.consecutiveWin||0) > 0 && (best.consecutiveWin||0) < PAROLI_CAP) {
             amt = Math.ceil((best.lastWinProfit || BET_LADDER[0]) * PAROLI_MULT);
         } else {
             amt = BET_LADDER[Math.min(best.retryCount, BET_LADDER.length-1)];
         }
         result.push({ ...best, betAmt: amt });
     } else {
-        // High tier: pool all, losses*1.1 split equally, apply paroli per signal
+        // High tier: pool all, split losses*1.1
         const pool        = [...high, ...normal];
-        const sumLost     = high.reduce((sum, s) => sum + (s.totalLost || 0), 0);
-        const totalNeeded = Math.max(sumLost * 1.1, BET_LADDER[SPLIT_FROM]);
-        const basePerSig  = Math.ceil(totalNeeded / pool.length);
+        const sumLost     = high.reduce((sum, s) => sum+(s.totalLost||0), 0);
+        const totalNeeded = Math.max(sumLost*1.1, BET_LADDER[SPLIT_FROM]);
+        const basePerSig  = Math.ceil(totalNeeded/pool.length);
         for (const sig of pool) {
             let amt = basePerSig;
-            if ((sig.consecutiveWin || 0) > 0 && (sig.consecutiveWin || 0) < PAROLI_CAP) {
-                amt = Math.ceil((sig.lastWinProfit || basePerSig) * PAROLI_MULT);
+            // Paroli only if in profit
+            if (isInProfit() && (sig.consecutiveWin||0) > 0 && (sig.consecutiveWin||0) < PAROLI_CAP) {
+                amt = Math.ceil((sig.lastWinProfit||basePerSig) * PAROLI_MULT);
             }
             result.push({ ...sig, betAmt: amt });
         }
     }
     return result;
 }
-
-const PAYOUT_RATE = 0.96;
 
 function secsToNext() {
     if (!db.nextDrawAt) return null;
@@ -233,18 +244,20 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
         lines.push('');
         lines.push(`📊 上期验证 (${hits}/${verResults.length} 命中) P&L: ${roundPL>=0?'+':''}${fmt(roundPL)}:`);
         for (const v of verResults) {
-            const plStr  = v.hit ? `+${fmt(v.betAmt*PAYOUT_RATE)}` : `-${fmt(v.betAmt)}`;
+            const plStr  = v.hit?`+${fmt(v.betAmt*PAYOUT_RATE)}`:`-${fmt(v.betAmt)}`;
             const mode   = v.recoveryMode?'🔄':v.consecutiveWin>0?`🔥×${v.consecutiveWin}`:'';
-            lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side} 杀${v.chase}⚔️ → 实际 *${v.actual}* (${plStr}) ${mode}`);
+            const aIcon  = v.action==='追'?'🔁':'⚔️';
+            lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side} ${v.action}${v.chase}${aIcon} → 实际 *${v.actual}* (${plStr}) ${mode}`);
         }
     }
 
     lines.push('');
     const todayPL    = db.balance - db.dayStart;
-    const targetLeft = Math.max(0, db.dailyTarget - db.balance);
+    const targetLeft = Math.max(0, db.dailyTarget-db.balance);
+    const profitMode = isInProfit() ? '📈' : '📉';
     lines.push(`💰 余额: *${fmt(db.balance)}* | 峰值: ${fmt(db.peakBalance)} | 谷值: ${fmt(db.troughBalance)}`);
-    lines.push(`🎯 今日: ${todayPL>=0?'+':''}${fmt(todayPL)} | 目标: ${fmt(db.dailyTarget)} | 还差: ${fmt(targetLeft)}`);
-    lines.push(`📈 总投: ${fmt(db.totalBet)} | 赢: +${fmt(db.totalWin)} | 输: -${fmt(db.totalLoss)} | 净: ${db.totalWin-db.totalLoss>=0?'+':''}${fmt(db.totalWin-db.totalLoss)}`);
+    lines.push(`${profitMode} 今日: ${todayPL>=0?'+':''}${fmt(todayPL)} | 目标: ${fmt(db.dailyTarget)} | 还差: ${fmt(targetLeft)}`);
+    lines.push(`📊 总投: ${fmt(db.totalBet)} | 赢: +${fmt(db.totalWin)} | 输: -${fmt(db.totalLoss)} | 净: ${db.totalWin-db.totalLoss>=0?'+':''}${fmt(db.totalWin-db.totalLoss)}`);
 
     lines.push('');
     lines.push(`\`─────────────────────────\``);
@@ -254,9 +267,8 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     if (db.busted) {
         lines.push(`🛑 *爆仓！已永久停止*`);
     } else if (db.stopped) {
-        const mytTime = new Date(db.resumeAt.getTime() + 8*60*60*1000);
         lines.push(`🎯 *今日+30%达成！已停止*`);
-        lines.push(`_次日 ${mytTime.toUTCString().slice(5,11)} 2pm MYT 恢复_`);
+        lines.push(`_次日 2pm MYT 恢复_`);
     } else if (bettedSignals.length === 0) {
         lines.push('_暂无信号_');
     } else {
@@ -264,21 +276,26 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
         const isRecovery   = bettedSignals.some(s=>s.recoveryMode);
         const isParoli     = bettedSignals.some(s=>(s.consecutiveWin||0)>0);
         const highCount    = bettedSignals.filter(s=>s.retryCount>=SPLIT_FROM).length;
+        const breakCount   = bettedSignals.filter(s=>s.action==='杀').length;
+        const contCount    = bettedSignals.filter(s=>s.action==='追').length;
 
-        if (isRecovery)      lines.push(`🔄 *回本模式* 目标: ${fmt(db.peakBalance)}`);
-        else if (isParoli)   lines.push(`🔥 *Paroli 顺风*`);
-        else if (highCount>1)lines.push(`⚠️ _均摊 ×${highCount}_`);
+        if (isRecovery)       lines.push(`🔄 *回本模式* 目标: ${fmt(db.peakBalance)}`);
+        else if (isParoli)    lines.push(`🔥 *Paroli 顺风* (盈利中)`);
+        else if (highCount>1) lines.push(`⚠️ _均摊 ×${highCount}_`);
+
+        if (breakCount>0 && contCount>0) lines.push(`_混合信号: 杀×${breakCount} 追×${contCount}_`);
+        lines.push('');
+        lines.push(`⭐  总注: *${fmt(totalNextBet)}*`);
         lines.push('');
 
-        lines.push(`⭐⭐  总注: *${fmt(totalNextBet)}*`);
-        lines.push('');
         for (const sig of bettedSignals) {
-            const retry = sig.retryCount>0?` ❌×${sig.retryCount}`:'';
-            const mode  = sig.recoveryMode?'🔄':(sig.consecutiveWin||0)>0?`🔥×${sig.consecutiveWin}`:'';
-            const dim   = db.dims.find(d=>d.id===sig.dimId);
-            const sLen  = dim ? currentStreakLen(db.rawHistory, dim.fn, sig.side) : sig.len;
+            const retry  = sig.retryCount>0?` ❌×${sig.retryCount}`:'';
+            const mode   = sig.recoveryMode?'🔄':(sig.consecutiveWin||0)>0?`🔥×${sig.consecutiveWin}`:'';
+            const aIcon  = sig.action==='追'?'🔁':'⚔️';
+            const dim    = db.dims.find(d=>d.id===sig.dimId);
+            const sLen   = dim?currentStreakLen(db.rawHistory,dim.fn,sig.side):sig.len;
             lines.push(`${sig.label} 连${sLen}${sig.side}${retry} ${mode}`);
-            lines.push(`杀${sig.chase}⚔️  下注 *${fmt(sig.betAmt)}*  _(${sig.pct}% n=${sig.n})_`);
+            lines.push(`${sig.action}${sig.chase}${aIcon}  下注 *${fmt(sig.betAmt)}*  _(${sig.pct}% n=${sig.n})_`);
             lines.push('');
         }
     }
@@ -309,18 +326,17 @@ async function init() {
     db.dims        = buildDimensions();
     db.signalTable = buildSignalTable(db.rawHistory);
     console.log(`[init] 信号表: ${db.signalTable.length} 条 (>=${HIGHLIGHT}%)`);
-    db.signalTable.forEach(s=>console.log(`  [杀] ${s.label} ${s.side}连${s.len}→${s.chase} ${s.pct}% n=${s.n}`));
+    db.signalTable.forEach(s=>console.log(`  [${s.action}] ${s.label} ${s.side}连${s.len}→${s.chase} ${s.pct}% n=${s.n}`));
 }
 
 async function poll() {
     const now = new Date();
 
-    // Check resume
     if (db.stopped && db.resumeAt && now >= db.resumeAt) {
         db.stopped     = false;
         db.resumeAt    = null;
         db.dayStart    = db.balance;
-        db.dailyTarget = Math.ceil(db.balance * (1 + DAILY_GROWTH));
+        db.dailyTarget = Math.ceil(db.balance*(1+DAILY_GROWTH));
         db.pendingSignals = [];
         console.log(`\n[RESUME] 新一天! 余额:${fmt(db.balance)} 目标:${fmt(db.dailyTarget)}`);
         send([
@@ -373,10 +389,9 @@ async function poll() {
             const actual = dim?dim.fn(raw):'?';
             const hit    = actual===ps.chase;
 
-            const profit = hit ? ps.betAmt * PAYOUT_RATE : -ps.betAmt;
             if (hit) {
-                db.balance  += ps.betAmt * PAYOUT_RATE;
-                db.totalWin += ps.betAmt * PAYOUT_RATE;
+                db.balance  += ps.betAmt*PAYOUT_RATE;
+                db.totalWin += ps.betAmt*PAYOUT_RATE;
             } else {
                 db.balance   -= ps.betAmt;
                 db.totalLoss += ps.betAmt;
@@ -386,29 +401,28 @@ async function poll() {
             db.troughBalance = Math.min(db.troughBalance, db.balance);
             db.drawsPlayed++;
 
-            const consecutiveWin  = hit ? (ps.consecutiveWin||0)+1 : 0;
-            const consecutiveLoss = hit ? 0 : (ps.consecutiveLoss||0)+1;
-            verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, actual, hit, betAmt:ps.betAmt, consecutiveWin:ps.consecutiveWin||0, recoveryMode:ps.recoveryMode||false });
-            console.log(`  [${hit?'HIT':'MISS'}] ${ps.label} 杀${ps.chase} → ${actual} | bet:${ps.betAmt} profit:${profit.toFixed(0)} bal:${fmt(db.balance)}`);
+            const consecutiveWin  = hit?(ps.consecutiveWin||0)+1:0;
+            const consecutiveLoss = hit?0:(ps.consecutiveLoss||0)+1;
+            verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, action:ps.action, actual, hit, betAmt:ps.betAmt, consecutiveWin:ps.consecutiveWin||0, recoveryMode:ps.recoveryMode||false });
+            console.log(`  [${hit?'HIT':'MISS'}] [${ps.action}] ${ps.label} ${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)}`);
 
-            if (db.balance <= STARTING_BALANCE - HARD_CAP_LOSS) {
+            if (db.balance <= STARTING_BALANCE-HARD_CAP_LOSS) {
                 db.busted = true;
                 console.log('  [BUSTED] 爆仓！');
             }
 
             if (!db.busted) {
                 if (hit && consecutiveWin >= PAROLI_CAP) {
-                    // Paroli cap hit — reset fully
                     console.log(`  [PAROLI RESET] ${ps.label} 连赢${consecutiveWin}次 重置`);
                 } else {
                     carryOver.push({
                         ...ps,
-                        retryCount     : hit ? 0 : ps.retryCount+1,
-                        totalLost      : hit ? 0 : (ps.totalLost||0)+ps.betAmt,
+                        retryCount    : hit?0:ps.retryCount+1,
+                        totalLost     : hit?0:(ps.totalLost||0)+ps.betAmt,
                         consecutiveLoss,
                         consecutiveWin,
-                        lastWinProfit  : hit ? ps.betAmt * PAYOUT_RATE : 0,
-                        recoveryMode   : false,
+                        lastWinProfit : hit?ps.betAmt*PAYOUT_RATE:0,
+                        recoveryMode  : false,
                         nextIssue,
                     });
                 }
@@ -421,24 +435,22 @@ async function poll() {
             return;
         }
 
-        // Daily target check
         if (db.balance >= db.dailyTarget) {
             db.stopped  = true;
             db.resumeAt = nextResume();
-            console.log(`  [TARGET] +30%达成! 余额:${fmt(db.balance)} 次日2pm MYT恢复`);
+            console.log(`  [TARGET] +30%达成! 次日2pm MYT恢复`);
             send(buildMsg(raw, [], verResults, nextIssue));
             setTimeout(poll,nextMs);
             return;
         }
 
-        // New signals
         const newSigs = evaluateSignals();
-        newSigs.forEach(s=>console.log(`  [NEW] ${s.label} ${s.side}连${s.len}→${s.chase} ${s.pct}%`));
+        newSigs.forEach(s=>console.log(`  [NEW][${s.action}] ${s.label} ${s.side}连${s.len}→${s.chase} ${s.pct}%`));
 
-        const seen   = new Set(carryOver.map(s=>`${s.dimId}|${s.side}|${s.len}`));
+        const seen   = new Set(carryOver.map(s=>`${s.dimId}|${s.side}|${s.len}|${s.action}`));
         const merged = [...carryOver];
         for (const sig of newSigs) {
-            const key = `${sig.dimId}|${sig.side}|${sig.len}`;
+            const key = `${sig.dimId}|${sig.side}|${sig.len}|${sig.action}`;
             if (!seen.has(key)) {
                 merged.push({ ...sig, retryCount:0, totalLost:0, consecutiveLoss:0, consecutiveWin:0, lastWinProfit:0, recoveryMode:false, nextIssue });
                 seen.add(key);
@@ -466,18 +478,18 @@ async function poll() {
 }
 
 (async()=>{
-    console.log('Dragon Sim Bot (Aggressive B)');
-    console.log(`   Chat: ${CHAT_ID}  Threshold: >=${HIGHLIGHT}%  Starting: ${STARTING_BALANCE}`);
-    console.log(`   Ladder: ${BET_LADDER.join('>')}  Split@idx${SPLIT_FROM}(${BET_LADDER[SPLIT_FROM]})`);
-    console.log(`   Paroli: x${PAROLI_MULT} cap ${PAROLI_CAP}  Recovery after ${RECOVERY_AFTER} losses`);
-    console.log(`   Daily: +${DAILY_GROWTH*100}% target  Resume 2pm MYT  Rebuild every ${REBUILD_EVERY} draws`);
+    console.log('Dragon Sim Bot (杀+追 混合)');
+    console.log(`   Chat: ${CHAT_ID}  Threshold: >=${HIGHLIGHT}%  MIN_N: ${MIN_N}  Starting: ${STARTING_BALANCE}`);
+    console.log(`   Ladder: ${BET_LADDER.join('>')}  Split@${BET_LADDER[SPLIT_FROM]}`);
+    console.log(`   Paroli: x${PAROLI_MULT} cap ${PAROLI_CAP} (盈利时才启用)  Recovery after ${RECOVERY_AFTER} losses`);
+    console.log(`   Daily: +${DAILY_GROWTH*100}% target  2pm MYT resume  Rebuild every ${REBUILD_EVERY} draws`);
     console.log('');
     try{await init();}catch(e){console.error('[init error]',e.message);process.exit(1);}
     send([
-        `🐲 *Dragon Sim Bot 已启动*`,
+        `🐲 *Dragon Sim Bot 已启动 (杀+追)*`,
         `💰 余额: *${STARTING_BALANCE}*  🎯 目标: *${Math.ceil(STARTING_BALANCE*(1+DAILY_GROWTH))}*`,
         `🪜 梯注: ${BET_LADDER.join('→')}  分拆@${BET_LADDER[SPLIT_FROM]}`,
-        `🔥 Paroli ×${PAROLI_MULT} 最多${PAROLI_CAP}连赢`,
+        `🔥 Paroli ×${PAROLI_MULT} 最多${PAROLI_CAP}连赢 (盈利才启用)`,
         `🔄 连败${RECOVERY_AFTER}次→回本模式`,
         `🔁 每${REBUILD_EVERY}期刷新信号表`,
         `🎯 达标停止，次日2pm MYT恢复`,
