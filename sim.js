@@ -12,11 +12,10 @@ const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=
 const HIGHLIGHT        = 60;
 const MIN_N            = 7;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
-const BET_LADDER       = [33, 38, 79, 167, 349, 733, 1400];
-const SPLIT_FROM       = 3;
+const PAROLI_BASE      = 33;   // base bet per cycle
+const PAROLI_TARGET    = 3;    // consecutive wins to complete a cycle then reset
 const STARTING_BALANCE = 2000;
 const HARD_CAP_LOSS    = 2000; // stop forever if balance hits 0
-const RECOVERY_AFTER   = 4;    // consecutive losses before recovery mode
 
 const posLabels = ['冠军','亚军','第三','第四','第五','第六','第七','第八','第九','第十'];
 
@@ -134,47 +133,15 @@ function evaluateSignals() {
     return active;
 }
 
-// Assign bets — normal ladder or recovery mode
-// Recovery mode: after RECOVERY_AFTER consecutive losses,
-// calculate exact amount needed to recover to peak, split across all signals
+// Paroli: bet = PAROLI_BASE * 2^consecutiveWins
+// Reset after any loss or after reaching PAROLI_TARGET consecutive wins
 function assignBets(signals) {
     if (signals.length === 0) return [];
-
-    const normal   = signals.filter(s => s.retryCount < SPLIT_FROM);
-    const high     = signals.filter(s => s.retryCount >= SPLIT_FROM);
-    const inRecovery = signals.some(s => (s.consecutiveLoss || 0) >= RECOVERY_AFTER);
-
-    if (inRecovery) {
-        // Recovery mode — need to win back to peak across all signals
-        // Each signal pays 1:1 (96%), so winning one bet of X returns X*0.96 net
-        // Total needed = peakBalance - balance
-        // Split across all signals: each needs to cover their share
-        const deficit    = db.peakBalance - db.balance;
-        const pool       = signals; // all signals join recovery
-        // To recover deficit across pool: each bet = ceil(deficit / pool.length / 0.96)
-        const perSig     = Math.ceil((deficit / pool.length) / 0.96);
-        const result     = [];
-        for (const sig of pool) {
-            result.push({ ...sig, betAmt: perSig, recoveryMode: true });
-        }
-        return result;
-    }
-
     const result = [];
-    if (high.length === 0) {
-        // Normal tier — single best signal
-        const best = normal.slice().sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
-        const amt  = BET_LADDER[Math.min(best.retryCount, BET_LADDER.length-1)];
-        result.push({ ...best, betAmt: amt });
-    } else {
-        // High tier active — pool everyone, split losses*1.1
-        const pool        = [...high, ...normal];
-        const sumLost     = high.reduce((sum, s) => sum + (s.totalLost || 0), 0);
-        const totalNeeded = Math.max(sumLost * 1.1, BET_LADDER[SPLIT_FROM]);
-        const perSig      = Math.ceil(totalNeeded / pool.length);
-        for (const sig of pool) {
-            result.push({ ...sig, betAmt: perSig });
-        }
+    for (const sig of signals) {
+        const wins   = sig.consecutiveWins || 0;
+        const betAmt = PAROLI_BASE * Math.pow(2, wins);
+        result.push({ ...sig, betAmt });
     }
     return result;
 }
@@ -213,8 +180,9 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
         lines.push('');
         lines.push(`📊 上期验证 (${hits}/${verResults.length} 命中) P&L: ${roundPL>=0?'+':''}${fmt(roundPL)}:`);
         for (const v of verResults) {
-            const plStr = v.hit ? `+${fmt(v.betAmt)}` : `-${fmt(v.betAmt)}`;
-            lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side} 杀${v.chase}⚔️ → 实际 *${v.actual}* (${plStr})`);
+            const plStr    = v.hit ? `+${fmt(v.betAmt)}` : `-${fmt(v.betAmt)}`;
+            const cycleStr = v.cycleComplete ? ' 🎉' : v.hit ? ` 🔥${v.wins+1}/${PAROLI_TARGET}` : '';
+            lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side} 杀${v.chase}⚔️ → 实际 *${v.actual}* (${plStr})${cycleStr}`);
         }
     }
 
@@ -232,25 +200,22 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     } else if (bettedSignals.length === 0) {
         lines.push('_暂无⭐⭐信号_');
     } else {
-        const totalNextBet  = bettedSignals.reduce((sum,s)=>sum+s.betAmt,0);
-        const isRecovery    = bettedSignals.some(s=>s.recoveryMode);
-        const highCount     = bettedSignals.filter(s=>s.retryCount>=SPLIT_FROM).length;
+        const totalNextBet = bettedSignals.reduce((sum,s)=>sum+s.betAmt,0);
+        const inCycle      = bettedSignals.some(s => (s.consecutiveWins || 0) > 0);
 
-        if (isRecovery) {
-            lines.push(`🔄 *回本模式* — 目标峰值: ${fmt(db.peakBalance)}`);
-            lines.push('');
-        } else if (highCount > 1) {
-            lines.push(`⚠️ _高级信号 ×${highCount}，均摊下注_`);
+        if (inCycle) {
+            lines.push(`🔥 *Paroli 连胜中*`);
             lines.push('');
         }
 
         lines.push(`⭐⭐  总注: *${fmt(totalNextBet)}*`);
         lines.push('');
         for (const sig of bettedSignals) {
-            const retry = sig.retryCount>0?` ❌×${sig.retryCount}`:'';
-            const dim   = db.dims.find(d=>d.id===sig.dimId);
-            const sLen  = dim ? currentStreakLen(db.rawHistory, dim.fn, sig.side) : sig.len;
-            lines.push(`${sig.label} 连${sLen}${sig.side}${retry}`);
+            const wins = sig.consecutiveWins || 0;
+            const dim  = db.dims.find(d=>d.id===sig.dimId);
+            const sLen = dim ? currentStreakLen(db.rawHistory, dim.fn, sig.side) : sig.len;
+            const cycleTag = wins > 0 ? ` 🔥${wins}/${PAROLI_TARGET}` : '';
+            lines.push(`${sig.label} 连${sLen}${sig.side}${cycleTag}`);
             lines.push(`杀${sig.chase}⚔️  下注 *${fmt(sig.betAmt)}*  _(${sig.pct}% n=${sig.n})_`);
             lines.push('');
         }
@@ -336,8 +301,10 @@ async function poll() {
             db.troughBalance = Math.min(db.troughBalance, db.balance);
             db.drawsPlayed++;
 
-            verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, actual, hit, betAmt:ps.betAmt });
-            console.log(`  [${hit?'HIT':'MISS'}] ${ps.label} 杀${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)}`);
+            const wins        = ps.consecutiveWins || 0;
+            const cycleComplete = hit && (wins + 1 >= PAROLI_TARGET);
+            verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, actual, hit, betAmt:ps.betAmt, wins, cycleComplete });
+            console.log(`  [${hit?'HIT':'MISS'}] ${ps.label} 杀${ps.chase} → ${actual} | bet:${ps.betAmt} wins:${wins}${cycleComplete?' CYCLE':''} bal:${fmt(db.balance)}`);
 
             // Hard cap check
             if (db.balance <= STARTING_BALANCE - HARD_CAP_LOSS) {
@@ -345,15 +312,9 @@ async function poll() {
                 console.log('  [BUSTED] 爆仓！');
             }
 
-            if (!hit && !db.busted) {
-                const consecutiveLoss = (ps.consecutiveLoss || 0) + 1;
-                carryOver.push({
-                    ...ps,
-                    retryCount: ps.retryCount+1,
-                    totalLost: (ps.totalLost||0)+ps.betAmt,
-                    consecutiveLoss,
-                    nextIssue
-                });
+            // Paroli: continue cycle on win (until target); reset on loss or cycle complete
+            if (hit && !cycleComplete && !db.busted) {
+                carryOver.push({ ...ps, consecutiveWins: wins + 1, nextIssue });
             }
         }
 
@@ -372,12 +333,12 @@ async function poll() {
         for (const sig of newSigs) {
             const key = `${sig.dimId}|${sig.side}|${sig.len}`;
             if (!seen.has(key)) {
-                merged.push({ ...sig, retryCount:0, totalLost:0, consecutiveLoss:0, nextIssue });
+                merged.push({ ...sig, consecutiveWins:0, nextIssue });
                 seen.add(key);
             }
         }
 
-        merged.sort((a,b)=>b.retryCount-a.retryCount||b.pct-a.pct||b.n-a.n);
+        merged.sort((a,b)=>b.consecutiveWins-a.consecutiveWins||b.pct-a.pct||b.n-a.n);
 
         const bettedSignals = assignBets(merged);
         db.pendingSignals = bettedSignals.map(s=>({ ...s, nextIssue }));
@@ -399,16 +360,17 @@ async function poll() {
 
 (async()=>{
     console.log('Dragon Sim Bot');
+    const paroliSteps = Array.from({length:PAROLI_TARGET},(_,i)=>PAROLI_BASE*Math.pow(2,i)).join(' → ');
     console.log(`   Chat: ${CHAT_ID}  Threshold: >=${HIGHLIGHT}%  Starting: ${STARTING_BALANCE}`);
-    console.log(`   Ladder: ${BET_LADDER.join(' > ')}  Split from: index ${SPLIT_FROM} (${BET_LADDER[SPLIT_FROM]})`);
-    console.log(`   Recovery after: ${RECOVERY_AFTER} losses  HardCap: -${HARD_CAP_LOSS}`);
+    console.log(`   Paroli: base=${PAROLI_BASE}  target=${PAROLI_TARGET} wins  steps: ${paroliSteps}  HardCap: -${HARD_CAP_LOSS}`);
     console.log('');
     try{await init();}catch(e){console.error('[init error]',e.message);process.exit(1);}
     send([
-        `*Dragon Sim Bot 已启动*`,
+        `*Dragon Sim Bot 已启动 (Paroli策略)*`,
         `起始余额: *${STARTING_BALANCE}*`,
-        `梯注: ${BET_LADDER.join(' > ')}`,
-        `连败${RECOVERY_AFTER}次 → 回本模式`,
+        `基础注: ${PAROLI_BASE} | 目标连胜: ${PAROLI_TARGET}次`,
+        `注额: ${Array.from({length:PAROLI_TARGET},(_,i)=>PAROLI_BASE*Math.pow(2,i)).join(' → ')}`,
+        `输/完成循环 → 重置，连胜加倍`,
         `硬顶: 亏损${HARD_CAP_LOSS}永久停止`,
     ].join('\n'));
     poll();
