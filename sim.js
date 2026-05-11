@@ -279,8 +279,8 @@ async function poll() {
             return;
         }
 
-        const verResults = [];
-        const carryOver  = [];
+        const verResults  = [];
+        const pendingConts = []; // { dimId, consecutiveWins } — resolved against fresh signals below
 
         for (const ps of db.pendingSignals) {
             if (ps.nextIssue !== raw.preDrawIssue) continue;
@@ -311,9 +311,9 @@ async function poll() {
                 console.log('  [BUSTED] 爆仓！');
             }
 
-            // Paroli: continue cycle on win (until target); reset on loss or cycle complete
+            // Paroli: on win, store intent to continue in same dimension with a fresh signal
             if (hit && !cycleComplete && !db.busted) {
-                carryOver.push({ ...ps, consecutiveWins: wins + 1, nextIssue });
+                pendingConts.push({ dimId: ps.dimId, consecutiveWins: wins + 1 });
             }
         }
 
@@ -327,8 +327,25 @@ async function poll() {
         const newSigs = evaluateSignals();
         newSigs.forEach(s=>console.log(`  [NEW] ${s.label} ${s.side}连${s.len}→${s.chase} ${s.pct}%`));
 
-        const seen   = new Set(carryOver.map(s=>`${s.dimId}|${s.side}|${s.len}`));
-        const merged = [...carryOver];
+        const merged = [];
+        const seen   = new Set();
+
+        // Resolve each continuation: find a fresh qualifying signal in the same dimension
+        for (const cont of pendingConts) {
+            const match = newSigs.find(s => s.dimId === cont.dimId);
+            if (match) {
+                const key = `${match.dimId}|${match.side}|${match.len}`;
+                if (!seen.has(key)) {
+                    merged.push({ ...match, consecutiveWins: cont.consecutiveWins, nextIssue });
+                    seen.add(key);
+                    console.log(`  [CONT] ${match.label} ${match.side}连${match.len}→${match.chase} 🔥${cont.consecutiveWins}/${PAROLI_TARGET}`);
+                }
+            } else {
+                console.log(`  [RESET] ${cont.dimId} no signal this round, cycle reset at ${cont.consecutiveWins}/${PAROLI_TARGET}`);
+            }
+        }
+
+        // Add fresh signals not already claimed by a continuation
         for (const sig of newSigs) {
             const key = `${sig.dimId}|${sig.side}|${sig.len}`;
             if (!seen.has(key)) {
