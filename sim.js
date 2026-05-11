@@ -9,7 +9,7 @@ const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_SIM_CHAT_ID_HERE';
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
-const HIGHLIGHT        = 70;
+const HIGHLIGHT        = 55;
 const MIN_N            = 7;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
 const BET_LADDER       = [33, 38, 79, 167, 349, 733, 1400];
