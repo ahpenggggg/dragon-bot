@@ -486,19 +486,25 @@ async function poll() {
             }
 
             if (!db.busted) {
-                if (hit && consecutiveWin >= PAROLI_CAP) {
-                    console.log(`  [PAROLI RESET] ${ps.label} 连赢${consecutiveWin}次 重置`);
-                } else if (!hit && ps.retryCount+1 >= MAX_RETRIES) {
+                if (hit) {
+                    // Win — drop signal, let fresh evaluation pick next best
+                    if (consecutiveWin >= PAROLI_CAP) {
+                        console.log(`  [PAROLI RESET] ${ps.label} 连赢${consecutiveWin}次 重置`);
+                    } else {
+                        console.log(`  [WIN DROP] ${ps.label} 已命中，释放信号`);
+                    }
+                } else if (ps.retryCount+1 >= MAX_RETRIES) {
                     // Zombie signal — drop it
                     console.log(`  [DROP] ${ps.label} 超过${MAX_RETRIES}次失败，丢弃`);
                 } else {
+                    // Loss — carry forward for martingale
                     carryOver.push({
                         ...ps,
-                        retryCount    : hit?0:ps.retryCount+1,
-                        totalLost     : hit?0:(ps.totalLost||0)+ps.betAmt,
+                        retryCount    : ps.retryCount+1,
+                        totalLost     : (ps.totalLost||0)+ps.betAmt,
                         consecutiveLoss,
-                        consecutiveWin,
-                        lastWinProfit : hit?ps.betAmt*PAYOUT_RATE:0,
+                        consecutiveWin: 0,
+                        lastWinProfit : 0,
                         recoveryMode  : false,
                         nextIssue,
                     });
