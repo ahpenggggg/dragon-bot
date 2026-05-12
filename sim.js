@@ -224,24 +224,28 @@ function assignBets(signals) {
     const paroliBet  = inProfit ? Math.max(Math.min(rawParoli, Math.floor(profit * 0.5)), BET_LADDER[0]) : 0;
 
     if (high.length === 0) {
-        const best = normal.slice().sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
+        // Prioritise carryover (retryCount > 0) over fresh signals
+        const carryNormal  = normal.filter(s => s.retryCount > 0).sort((a,b) => b.retryCount-a.retryCount || b.pct-a.pct)[0];
+        const freshNormal  = normal.filter(s => s.retryCount === 0).sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
+        const best         = carryNormal || freshNormal;
         let amt;
         if (inProfit && (best.consecutiveWin||0) > 0 && (best.consecutiveWin||0) < PAROLI_CAP) {
-            // Paroli: bet profit * 1.7
             amt = paroliBet;
         } else {
             amt = BET_LADDER[Math.min(best.retryCount, BET_LADDER.length-1)];
         }
         result.push({ ...best, betAmt: amt });
     } else {
-        const pool        = [...high, ...normal];
+        // Only include fresh signals in split pool if they are carryovers too
+        // Fresh (retryCount=0) signals don't join the high-tier split pool
+        const carryNormal = normal.filter(s => s.retryCount > 0);
+        const pool        = [...high, ...carryNormal];
         const sumLost     = high.reduce((sum, s) => sum+(s.totalLost||0), 0);
         const totalNeeded = Math.max(sumLost*1.1, BET_LADDER[SPLIT_FROM]);
         const basePerSig  = Math.ceil(totalNeeded/pool.length);
         for (const sig of pool) {
             let amt = basePerSig;
             if (inProfit && (sig.consecutiveWin||0) > 0 && (sig.consecutiveWin||0) < PAROLI_CAP) {
-                // Split paroli bet across pool
                 amt = Math.ceil(paroliBet / pool.length);
             }
             result.push({ ...sig, betAmt: Math.max(amt, 1) });
