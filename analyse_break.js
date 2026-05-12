@@ -32,8 +32,6 @@ function buildDimensions() {
             }
         });
     }
-    dims.push({ id:'gyDS', label:'冠亚和 单双', fn: r => r.sumFS % 2 !== 0 ? '单' : '双' });
-    dims.push({ id:'gyDX', label:'冠亚和 大小', fn: r => r.sumFS < 12 ? '小' : '大' });
     return dims;
 }
 
