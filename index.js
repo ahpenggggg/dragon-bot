@@ -62,15 +62,25 @@ function buildSignalTable(rawRecords) {
     const sigs = [];
     for (const dim of dims) {
         const vals = rawRecords.map(dim.fn);
+        const isDT = dim.id.startsWith('dt');
         for (const len of CHECKS) {
             const res = countStreakFollowup(vals, len);
             for (const [side, s] of Object.entries(res.bySide)) {
                 if (s.total < MIN_N) continue;
-                const pair = dim.id.includes('DS')?['单','双']:dim.id.startsWith('dt')?['龙','虎']:['大','小'];
+                const pair = dim.id.includes('DS')?['单','双']:isDT?['龙','虎']:['大','小'];
                 const opp  = pair.find(x=>x!==side);
-                const bPct = Math.round(s.break/s.total*100);
-                if (bPct >= HIGHLIGHT) {
-                    sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'杀', chase:opp, pct:bPct, n:s.total });
+                if (isDT) {
+                    // 龙虎: chase (追) — bet on streak continuing
+                    const cPct = Math.round((s.total - s.break) / s.total * 100);
+                    if (cPct >= HIGHLIGHT) {
+                        sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'追', chase:side, pct:cPct, n:s.total });
+                    }
+                } else {
+                    // All others: kill (杀) — bet on streak breaking
+                    const bPct = Math.round(s.break/s.total*100);
+                    if (bPct >= HIGHLIGHT) {
+                        sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'杀', chase:opp, pct:bPct, n:s.total });
+                    }
                 }
             }
         }
@@ -153,7 +163,8 @@ function buildMsg(raw, nextSignals, verResults, nextIssue) {
         lines.push('');
         lines.push(`📊 上期验证 (${hits}/${verResults.length} 命中):`);
         for (const v of verResults) {
-            lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side} 杀${v.chase}⚔️ → 实际 *${v.actual}*`);
+            const aIcon = v.action==='追' ? `追${v.chase}🔁` : `杀${v.chase}⚔️`;
+            lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side} ${aIcon} → 实际 *${v.actual}*`);
         }
     }
 
@@ -171,8 +182,9 @@ function buildMsg(raw, nextSignals, verResults, nextIssue) {
             const dim  = db.dims.find(d=>d.id===sig.dimId);
             const sLen = dim ? currentStreakLen(db.rawHistory, dim.fn, sig.side) : sig.len;
             const retry= sig.retryCount>0?` ❌×${sig.retryCount}`:'';
+            const aIcon = sig.action==='追' ? `追${sig.chase}🔁` : `杀${sig.chase}⚔️`;
             lines.push(`${sig.label} 连${sLen}${sig.side}${retry}`);
-            lines.push(`杀${sig.chase}⚔️  _(${sig.pct}% n=${sig.n})_`);
+            lines.push(`${aIcon}  _(${sig.pct}% n=${sig.n})_`);
             lines.push('');
         }
     }
@@ -230,11 +242,6 @@ async function poll() {
         db.rawHistory.push(raw);
         if (db.rawHistory.length>1000) db.rawHistory.shift();
 
-        if (db.drawCount % 25 === 0) {
-            db.signalTable = buildSignalTable(db.rawHistory);
-            console.log(`  [REBUILD] 信号表已刷新 (第${db.drawCount}期): ${db.signalTable.length} 条`);
-        }
-
         const verResults = [];
         const carryOver  = [];
 
@@ -243,8 +250,8 @@ async function poll() {
             const dim    = db.dims.find(d=>d.id===ps.dimId);
             const actual = dim?dim.fn(raw):'?';
             const hit    = actual===ps.chase;
-            verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, actual, hit });
-            console.log(`  [${hit?'HIT':'MISS'}] ${ps.label} 杀${ps.chase} → ${actual}`);
+            verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, action:ps.action||'杀', actual, hit });
+            console.log(`  [${hit?'HIT':'MISS'}] [${ps.action||'杀'}] ${ps.label} ${ps.chase} → ${actual}`);
             if (!hit) {
                 carryOver.push({ ...ps, retryCount: ps.retryCount+1, nextIssue });
             }
@@ -258,7 +265,7 @@ async function poll() {
         for (const sig of newSigs) {
             const key = `${sig.dimId}|${sig.side}|${sig.len}`;
             if (!seen.has(key)) {
-                merged.push({ ...sig, retryCount:0, nextIssue });
+                merged.push({ ...sig, retryCount:0, nextIssue, action:sig.action||'杀' });
                 seen.add(key);
             }
         }
