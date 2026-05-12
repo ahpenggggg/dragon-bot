@@ -198,11 +198,11 @@ function nextResume() {
 }
 
 function currentProfit() {
-    return db.balance - STARTING_BALANCE;
+    return db.balance - db.dayStart;
 }
 
 function isInProfit() {
-    return db.balance > STARTING_BALANCE;
+    return db.balance > db.dayStart;
 }
 
 function assignBets(signals) {
@@ -455,10 +455,12 @@ async function poll() {
             db.troughBalance = Math.min(db.troughBalance, db.balance);
             db.drawsPlayed++;
 
-            const consecutiveWin  = hit?(ps.consecutiveWin||0)+1:0;
+            // Paroli win streak only counts when in profit (balance > STARTING_BALANCE)
+            const inProfitNow     = db.balance > db.dayStart;
+            const consecutiveWin  = hit && inProfitNow ? (ps.consecutiveWin||0)+1 : 0;
             const consecutiveLoss = hit?0:(ps.consecutiveLoss||0)+1;
             verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, action:ps.action, actual, hit, betAmt:ps.betAmt, consecutiveWin:ps.consecutiveWin||0, recoveryMode:ps.recoveryMode||false });
-            console.log(`  [${hit?'HIT':'MISS'}] [${ps.action}] ${ps.label} ${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)}`);
+            console.log(`  [${hit?'HIT':'MISS'}] [${ps.action}] ${ps.label} ${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)} inProfit:${inProfitNow}`);
 
             if (db.balance <= STARTING_BALANCE-HARD_CAP_LOSS) {
                 db.busted = true;
