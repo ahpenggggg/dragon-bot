@@ -23,9 +23,6 @@ const DAILY_GROWTH     = 0.30;
 const RESUME_HOUR_MYT  = 14;
 const REBUILD_EVERY    = 25;
 const PAYOUT_RATE      = 0.96;
-const MAX_RECOVERY_SIGS = 6;    // max signals in recovery pool
-const MAX_RECOVERY_BET  = 400;  // max total bet in recovery per round
-const MAX_RETRIES       = 5;    // drop signal after this many losses
 
 const posLabels = ['冠军','亚军','第三','第四','第五','第六','第七','第八','第九','第十'];
 
@@ -141,51 +138,18 @@ const db = {
     resumeAt      : null,
 };
 
-// Dynamic signal evaluation — check live streak for every dimension,
-// look up historical break/continue rate for that exact streak length
 function evaluateSignals() {
     const active = [];
     const seen   = new Set();
-    const MIN_STREAK = 3;
-
-    for (const dim of db.dims) {
-        // Find current streak side and length
-        if (db.rawHistory.length === 0) continue;
-        const lastVal = dim.fn(db.rawHistory[db.rawHistory.length-1]);
-        const streakLen = currentStreakLen(db.rawHistory, dim.fn, lastVal);
-        if (streakLen < MIN_STREAK) continue;
-
-        // Look up historical stats for this exact streak length
-        const vals = db.rawHistory.map(dim.fn);
-        const res  = countStreakFollowup(vals, streakLen);
-        const s    = res.bySide[lastVal];
-        if (!s || s.total < MIN_N) continue;
-
-        const pair  = dim.id.includes('DS')?['单','双']:dim.id.startsWith('dt')?['龙','虎']:['大','小'];
-        const opp   = pair.find(x=>x!==lastVal);
-        const bPct  = Math.round(s.break/s.total*100);
-        const cPct  = Math.round(s.continue/s.total*100);
-
-        // Break signal (杀)
-        if (bPct >= HIGHLIGHT) {
-            const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
-            if (!seen.has(key)) {
-                seen.add(key);
-                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
-            }
-        }
-        // Continue signal (追)
-        if (cPct >= HIGHLIGHT) {
-            const key = `${dim.id}|${lastVal}|${streakLen}|追`;
-            if (!seen.has(key)) {
-                seen.add(key);
-                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
-            }
-        }
+    for (const sig of db.signalTable) {
+        const key = `${sig.dimId}|${sig.side}|${sig.len}|${sig.action}`;
+        if (seen.has(key)) continue;
+        const dim = db.dims.find(d=>d.id===sig.dimId);
+        if (!dim) continue;
+        if (!matchesStreak(db.rawHistory, dim.fn, sig.side, sig.len)) continue;
+        seen.add(key);
+        active.push(sig);
     }
-
-    // Sort by pct desc
-    active.sort((a,b)=>b.pct-a.pct||b.n-a.n);
     return active;
 }
 
@@ -197,12 +161,8 @@ function nextResume() {
     return resume;
 }
 
-function currentProfit() {
-    return db.balance - STARTING_BALANCE;
-}
-
 function isInProfit() {
-    return db.balance > STARTING_BALANCE;
+    return db.balance > db.dayStart;
 }
 
 function assignBets(signals) {
@@ -212,53 +172,39 @@ function assignBets(signals) {
 
     if (inRecovery) {
         const deficit = db.peakBalance - db.balance;
-        // Cap pool: keep highest % signals only, max MAX_RECOVERY_SIGS
-        const pool = signals
-            .slice()
-            .sort((a,b) => b.pct-a.pct || b.n-a.n)
-            .slice(0, MAX_RECOVERY_SIGS);
-        // Calculate per signal amount, cap total at MAX_RECOVERY_BET
-        let perSig = Math.ceil((deficit / pool.length) / PAYOUT_RATE);
-        const totalBet = perSig * pool.length;
-        if (totalBet > MAX_RECOVERY_BET) {
-            perSig = Math.floor(MAX_RECOVERY_BET / pool.length);
-        }
-        perSig = Math.max(perSig, BET_LADDER[0]);
-        return pool.map(s => ({ ...s, betAmt: perSig, recoveryMode: true }));
+        const pool    = signals;
+        const perSig  = Math.ceil((deficit / pool.length) / PAYOUT_RATE);
+        return pool.map(s => ({ ...s, betAmt: Math.max(perSig, BET_LADDER[0]), recoveryMode: true }));
     }
 
     const normal = signals.filter(s => s.retryCount < SPLIT_FROM);
     const high   = signals.filter(s => s.retryCount >= SPLIT_FROM);
     const result = [];
 
-    // Paroli bet = actual profit above STARTING_BALANCE * PAROLI_MULT
-    // Only available when in profit, bet size = profit * mult split across signals
-    const profit     = currentProfit();
-    const inProfit   = profit > 0;
-    const paroliBet  = inProfit ? Math.max(Math.ceil(profit * PAROLI_MULT), BET_LADDER[0]) : 0;
-
     if (high.length === 0) {
+        // Single best signal by pct
         const best = normal.slice().sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
         let amt;
-        if (inProfit && (best.consecutiveWin||0) > 0 && (best.consecutiveWin||0) < PAROLI_CAP) {
-            // Paroli: bet profit * 1.7
-            amt = paroliBet;
+        // Paroli only if in profit
+        if (isInProfit() && (best.consecutiveWin||0) > 0 && (best.consecutiveWin||0) < PAROLI_CAP) {
+            amt = Math.ceil((best.lastWinProfit || BET_LADDER[0]) * PAROLI_MULT);
         } else {
             amt = BET_LADDER[Math.min(best.retryCount, BET_LADDER.length-1)];
         }
         result.push({ ...best, betAmt: amt });
     } else {
+        // High tier: pool all, split losses*1.1
         const pool        = [...high, ...normal];
         const sumLost     = high.reduce((sum, s) => sum+(s.totalLost||0), 0);
         const totalNeeded = Math.max(sumLost*1.1, BET_LADDER[SPLIT_FROM]);
         const basePerSig  = Math.ceil(totalNeeded/pool.length);
         for (const sig of pool) {
             let amt = basePerSig;
-            if (inProfit && (sig.consecutiveWin||0) > 0 && (sig.consecutiveWin||0) < PAROLI_CAP) {
-                // Split paroli bet across pool
-                amt = Math.ceil(paroliBet / pool.length);
+            // Paroli only if in profit
+            if (isInProfit() && (sig.consecutiveWin||0) > 0 && (sig.consecutiveWin||0) < PAROLI_CAP) {
+                amt = Math.ceil((sig.lastWinProfit||basePerSig) * PAROLI_MULT);
             }
-            result.push({ ...sig, betAmt: Math.max(amt, 1) });
+            result.push({ ...sig, betAmt: amt });
         }
     }
     return result;
@@ -379,8 +325,8 @@ async function init() {
     console.log(`[init] ${db.rawHistory.length} 期 (${db.startIssue} → ${db.lastIssue})`);
     db.dims        = buildDimensions();
     db.signalTable = buildSignalTable(db.rawHistory);
-    console.log(`[init] 静态信号表: ${db.signalTable.length} 条 (>=${HIGHLIGHT}%) — 仅供参考，实际用动态评估`);
-    console.log(`[init] 动态模式: 每期实时计算当前连线长度和胜率`);
+    console.log(`[init] 信号表: ${db.signalTable.length} 条 (>=${HIGHLIGHT}%)`);
+    db.signalTable.forEach(s=>console.log(`  [${s.action}] ${s.label} ${s.side}连${s.len}→${s.chase} ${s.pct}% n=${s.n}`));
 }
 
 async function poll() {
@@ -468,9 +414,6 @@ async function poll() {
             if (!db.busted) {
                 if (hit && consecutiveWin >= PAROLI_CAP) {
                     console.log(`  [PAROLI RESET] ${ps.label} 连赢${consecutiveWin}次 重置`);
-                } else if (!hit && ps.retryCount+1 >= MAX_RETRIES) {
-                    // Zombie signal — drop it
-                    console.log(`  [DROP] ${ps.label} 超过${MAX_RETRIES}次失败，丢弃`);
                 } else {
                     carryOver.push({
                         ...ps,
