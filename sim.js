@@ -71,33 +71,39 @@ function countStreakFollowup(vals, streakLen) {
     return res;
 }
 
-// Build signal table for both break (杀) and continue (追)
+// Build signal table: DT=追 only, others=杀+追
 function buildSignalTable(rawRecords) {
     const dims = buildDimensions();
     const sigs = [];
     for (const dim of dims) {
         const vals = rawRecords.map(dim.fn);
+        const isDT = dim.id.startsWith('dt');
         for (const len of CHECKS) {
             const res = countStreakFollowup(vals, len);
             for (const [side, s] of Object.entries(res.bySide)) {
                 if (s.total < MIN_N) continue;
-                const pair  = dim.id.includes('DS')?['单','双']:dim.id.startsWith('dt')?['龙','虎']:['大','小'];
-                const opp   = pair.find(x=>x!==side);
-                const bPct  = Math.round(s.break/s.total*100);
-                const cPct  = Math.round(s.continue/s.total*100);
+                const pair = dim.id.includes('DS')?['单','双']:isDT?['龙','虎']:['大','小'];
+                const opp  = pair.find(x=>x!==side);
+                const bPct = Math.round(s.break/s.total*100);
+                const cPct = Math.round(s.continue/s.total*100);
 
-                // Break signal (杀) — bet opposite
-                if (bPct >= HIGHLIGHT) {
-                    sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'杀', chase:opp, pct:bPct, n:s.total });
-                }
-                // Continue signal (追) — bet same side
-                if (cPct >= HIGHLIGHT) {
-                    sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'追', chase:side, pct:cPct, n:s.total });
+                if (isDT) {
+                    // 龙虎: chase only (追)
+                    if (cPct >= HIGHLIGHT) {
+                        sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'追', chase:side, pct:cPct, n:s.total });
+                    }
+                } else {
+                    // Others: both break (杀) and continue (追)
+                    if (bPct >= HIGHLIGHT) {
+                        sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'杀', chase:opp, pct:bPct, n:s.total });
+                    }
+                    if (cPct >= HIGHLIGHT) {
+                        sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'追', chase:side, pct:cPct, n:s.total });
+                    }
                 }
             }
         }
     }
-    // Sort by pct desc — highest probability first regardless of action type
     sigs.sort((a,b)=>b.pct-a.pct||b.n-a.n);
     return sigs;
 }
@@ -166,20 +172,31 @@ function evaluateSignals() {
         const bPct  = Math.round(s.break/s.total*100);
         const cPct  = Math.round(s.continue/s.total*100);
 
-        // Break signal (杀)
-        if (bPct >= HIGHLIGHT) {
-            const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
-            if (!seen.has(key)) {
-                seen.add(key);
-                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
+        const isDT = dim.id.startsWith('dt');
+        if (isDT) {
+            // 龙虎: chase only (追)
+            if (cPct >= HIGHLIGHT) {
+                const key = `${dim.id}|${lastVal}|${streakLen}|追`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
+                }
             }
-        }
-        // Continue signal (追)
-        if (cPct >= HIGHLIGHT) {
-            const key = `${dim.id}|${lastVal}|${streakLen}|追`;
-            if (!seen.has(key)) {
-                seen.add(key);
-                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
+        } else {
+            // Others: both break (杀) and continue (追)
+            if (bPct >= HIGHLIGHT) {
+                const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
+                }
+            }
+            if (cPct >= HIGHLIGHT) {
+                const key = `${dim.id}|${lastVal}|${streakLen}|追`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
+                }
             }
         }
     }
