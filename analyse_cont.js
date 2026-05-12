@@ -204,6 +204,17 @@ function analyse(records) {
             }
             console.log('');
         }
+
+        const largeSample = summaryHigh.filter(h => h.n > 25);
+        largeSample.sort((a, b) => b.n - a.n || b.pct - a.pct);
+        if (largeSample.length > 0) {
+            console.log('  ── 📊 >25次样本 (高置信度) ──');
+            for (const h of largeSample) {
+                const stars = h.pct >= 70 ? '⭐⭐' : '⭐ ';
+                console.log(`  ${stars} ${h.dim} ${h.side}连${h.len}→${h.action}  ${h.pct}%  (${h.n}次样本)`);
+            }
+            console.log('');
+        }
     }
 
     console.log(SEP);
