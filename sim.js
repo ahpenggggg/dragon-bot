@@ -231,11 +231,12 @@ function assignBets(signals) {
     const high   = signals.filter(s => s.retryCount >= SPLIT_FROM);
     const result = [];
 
-    // Paroli bet = actual profit above STARTING_BALANCE * PAROLI_MULT
-    // Only available when in profit, bet size = profit * mult split across signals
+    // Paroli bet = actual profit above dayStart * PAROLI_MULT
+    // Capped at 50% of current profit to always protect at least half the gains
     const profit     = currentProfit();
     const inProfit   = profit > 0;
-    const paroliBet  = inProfit ? Math.max(Math.ceil(profit * PAROLI_MULT), BET_LADDER[0]) : 0;
+    const rawParoli  = inProfit ? Math.ceil(profit * PAROLI_MULT) : 0;
+    const paroliBet  = inProfit ? Math.max(Math.min(rawParoli, Math.floor(profit * 0.5)), BET_LADDER[0]) : 0;
 
     if (high.length === 0) {
         const best = normal.slice().sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
