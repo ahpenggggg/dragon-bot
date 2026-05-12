@@ -12,8 +12,8 @@ const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=
 const HIGHLIGHT        = 55;
 const MIN_N            = 5;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
-const BET_LADDER       = [33, 38, 79, 167, 349, 733, 1400];
-const SPLIT_FROM       = 3;
+const BET_LADDER       = [33, 66, 132, 264, 528, 1056];
+const SPLIT_FROM       = 3;  // split from 264 onwards
 const RECOVERY_AFTER   = 4;
 const PAROLI_MULT      = 1.7;
 const PAROLI_CAP       = 3;
@@ -146,12 +146,25 @@ function evaluateSignals() {
         const pair  = dim.id.includes('DS')?['单','双']:['大','小'];
         const opp   = pair.find(x=>x!==lastVal);
         const bPct  = Math.round(s.break/s.total*100);
+        const cPct  = 100 - bPct;
 
-        if (bPct >= HIGHLIGHT) {
-            const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
-            if (!seen.has(key)) {
-                seen.add(key);
-                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
+        if (streakLen >= 7) {
+            // Long streak (>=7) — switch to 追, bet on continuation
+            if (cPct >= HIGHLIGHT) {
+                const key = `${dim.id}|${lastVal}|${streakLen}|追`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
+                }
+            }
+        } else {
+            // Normal — 杀, bet on break
+            if (bPct >= HIGHLIGHT) {
+                const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
+                }
             }
         }
     }
@@ -274,7 +287,8 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
             const plStr  = v.hit?`+${fmt(v.betAmt*PAYOUT_RATE)}`:`-${fmt(v.betAmt)}`;
             const mode   = v.recoveryMode?'🔄':v.consecutiveWin>0?`🔥×${v.consecutiveWin}`:'';
             const aIcon  = v.action==='追'?'🔁':'⚔️';
-            lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side} ${v.action}${v.chase}${aIcon} → 实际 *${v.actual}* (${plStr}) ${mode}`);
+            const longV  = v.action==='追'?' 🐉':'';
+            lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side}${longV} ${v.action}${v.chase}${aIcon} → 实际 *${v.actual}* (${plStr}) ${mode}`);
         }
     }
 
@@ -316,7 +330,8 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
             const aIcon  = sig.action==='追'?'🔁':'⚔️';
             const dim    = db.dims.find(d=>d.id===sig.dimId);
             const sLen   = dim?currentStreakLen(db.rawHistory,dim.fn,sig.side):sig.len;
-            lines.push(`${sig.label} 连${sLen}${sig.side}${retry} ${mode}`);
+            const longTag = sig.action==='追' && sLen>=7 ? ' 🐉长龙' : '';
+            lines.push(`${sig.label} 连${sLen}${sig.side}${retry}${longTag} ${mode}`);
             lines.push(`${sig.action}${sig.chase}${aIcon}  下注 *${fmt(sig.betAmt)}*  _(${sig.pct}% n=${sig.n})_`);
             lines.push('');
         }
