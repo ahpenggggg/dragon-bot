@@ -42,16 +42,6 @@ function buildDimensions() {
             fn: r => { const n=r.preDrawCode.split(',').map(Number)[pos]; return n<=5?'小':'大'; }
         });
     }
-    for (let i = 0; i < 5; i++) {
-        const pos = i;
-        dims.push({
-            id:`dt${i+1}`, label:`第${i+1}名 龙虎`,
-            fn: r => {
-                const nums = r.preDrawCode.split(',').map(Number);
-                return nums[pos] > nums[9-pos] ? '龙' : '虎';
-            }
-        });
-    }
     return dims;
 }
 
@@ -77,29 +67,19 @@ function buildSignalTable(rawRecords) {
     const sigs = [];
     for (const dim of dims) {
         const vals = rawRecords.map(dim.fn);
-        const isDT = dim.id.startsWith('dt');
         for (const len of CHECKS) {
             const res = countStreakFollowup(vals, len);
             for (const [side, s] of Object.entries(res.bySide)) {
                 if (s.total < MIN_N) continue;
-                const pair = dim.id.includes('DS')?['单','双']:isDT?['龙','虎']:['大','小'];
+                const pair = dim.id.includes('DS')?['单','双']:['大','小'];
                 const opp  = pair.find(x=>x!==side);
                 const bPct = Math.round(s.break/s.total*100);
                 const cPct = Math.round(s.continue/s.total*100);
-
-                if (isDT) {
-                    // 龙虎: chase only (追)
-                    if (cPct >= HIGHLIGHT) {
-                        sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'追', chase:side, pct:cPct, n:s.total });
-                    }
-                } else {
-                    // Others: both break (杀) and continue (追)
-                    if (bPct >= HIGHLIGHT) {
-                        sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'杀', chase:opp, pct:bPct, n:s.total });
-                    }
-                    if (cPct >= HIGHLIGHT) {
-                        sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'追', chase:side, pct:cPct, n:s.total });
-                    }
+                if (bPct >= HIGHLIGHT) {
+                    sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'杀', chase:opp, pct:bPct, n:s.total });
+                }
+                if (cPct >= HIGHLIGHT) {
+                    sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'追', chase:side, pct:cPct, n:s.total });
                 }
             }
         }
@@ -167,36 +147,23 @@ function evaluateSignals() {
         const s    = res.bySide[lastVal];
         if (!s || s.total < MIN_N) continue;
 
-        const pair  = dim.id.includes('DS')?['单','双']:dim.id.startsWith('dt')?['龙','虎']:['大','小'];
+        const pair  = dim.id.includes('DS')?['单','双']:['大','小'];
         const opp   = pair.find(x=>x!==lastVal);
         const bPct  = Math.round(s.break/s.total*100);
         const cPct  = Math.round(s.continue/s.total*100);
 
-        const isDT = dim.id.startsWith('dt');
-        if (isDT) {
-            // 龙虎: chase only (追)
-            if (cPct >= HIGHLIGHT) {
-                const key = `${dim.id}|${lastVal}|${streakLen}|追`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
-                }
+        if (bPct >= HIGHLIGHT) {
+            const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
             }
-        } else {
-            // Others: both break (杀) and continue (追)
-            if (bPct >= HIGHLIGHT) {
-                const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
-                }
-            }
-            if (cPct >= HIGHLIGHT) {
-                const key = `${dim.id}|${lastVal}|${streakLen}|追`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
-                }
+        }
+        if (cPct >= HIGHLIGHT) {
+            const key = `${dim.id}|${lastVal}|${streakLen}|追`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
             }
         }
     }
@@ -493,11 +460,14 @@ async function poll() {
                     } else {
                         console.log(`  [WIN DROP] ${ps.label} 已命中，释放信号`);
                     }
+                } else if (ps.action === '追') {
+                    // 追 signal lost — drop it, streak likely broken
+                    console.log(`  [DROP] ${ps.label} 追信号失败，丢弃`);
                 } else if (ps.retryCount+1 >= MAX_RETRIES) {
                     // Zombie signal — drop it
                     console.log(`  [DROP] ${ps.label} 超过${MAX_RETRIES}次失败，丢弃`);
                 } else {
-                    // Loss — carry forward for martingale
+                    // 杀 loss — carry forward for martingale
                     carryOver.push({
                         ...ps,
                         retryCount    : ps.retryCount+1,
