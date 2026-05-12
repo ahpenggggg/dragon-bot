@@ -53,10 +53,10 @@ function countStreakFollowup(vals, streakLen) {
         if (!w.every(v=>v===side)) continue;
         const before = vals[i-streakLen-1];
         if (before === side) continue;
-        const cont = vals[i]===side;
-        if (!res.bySide[side]) res.bySide[side]={continue:0,break:0,total:0};
+        const broke = vals[i]!==side;
+        if (!res.bySide[side]) res.bySide[side]={break:0,total:0};
         res.bySide[side].total++;
-        cont ? res.bySide[side].continue++ : res.bySide[side].break++;
+        if (broke) res.bySide[side].break++;
     }
     return res;
 }
@@ -74,12 +74,8 @@ function buildSignalTable(rawRecords) {
                 const pair = dim.id.includes('DS')?['单','双']:['大','小'];
                 const opp  = pair.find(x=>x!==side);
                 const bPct = Math.round(s.break/s.total*100);
-                const cPct = Math.round(s.continue/s.total*100);
                 if (bPct >= HIGHLIGHT) {
                     sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'杀', chase:opp, pct:bPct, n:s.total });
-                }
-                if (cPct >= HIGHLIGHT) {
-                    sigs.push({ dimId:dim.id, label:dim.label, side, len, action:'追', chase:side, pct:cPct, n:s.total });
                 }
             }
         }
@@ -150,20 +146,12 @@ function evaluateSignals() {
         const pair  = dim.id.includes('DS')?['单','双']:['大','小'];
         const opp   = pair.find(x=>x!==lastVal);
         const bPct  = Math.round(s.break/s.total*100);
-        const cPct  = Math.round(s.continue/s.total*100);
 
         if (bPct >= HIGHLIGHT) {
             const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
             if (!seen.has(key)) {
                 seen.add(key);
                 active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
-            }
-        }
-        if (cPct >= HIGHLIGHT) {
-            const key = `${dim.id}|${lastVal}|${streakLen}|追`;
-            if (!seen.has(key)) {
-                seen.add(key);
-                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
             }
         }
     }
@@ -315,14 +303,9 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
         const isRecovery   = bettedSignals.some(s=>s.recoveryMode);
         const isParoli     = bettedSignals.some(s=>(s.consecutiveWin||0)>0);
         const highCount    = bettedSignals.filter(s=>s.retryCount>=SPLIT_FROM).length;
-        const breakCount   = bettedSignals.filter(s=>s.action==='杀').length;
-        const contCount    = bettedSignals.filter(s=>s.action==='追').length;
-
         if (isRecovery)       lines.push(`🔄 *回本模式* 目标: ${fmt(db.peakBalance)}`);
         else if (isParoli)    lines.push(`🔥 *Paroli 顺风* (盈利中)`);
         else if (highCount>1) lines.push(`⚠️ _均摊 ×${highCount}_`);
-
-        if (breakCount>0 && contCount>0) lines.push(`_混合信号: 杀×${breakCount} 追×${contCount}_`);
         lines.push('');
         lines.push(`⭐  总注: *${fmt(totalNextBet)}*`);
         lines.push('');
@@ -460,9 +443,6 @@ async function poll() {
                     } else {
                         console.log(`  [WIN DROP] ${ps.label} 已命中，释放信号`);
                     }
-                } else if (ps.action === '追') {
-                    // 追 signal lost — drop it, streak likely broken
-                    console.log(`  [DROP] ${ps.label} 追信号失败，丢弃`);
                 } else if (ps.retryCount+1 >= MAX_RETRIES) {
                     // Zombie signal — drop it
                     console.log(`  [DROP] ${ps.label} 超过${MAX_RETRIES}次失败，丢弃`);
