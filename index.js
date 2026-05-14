@@ -285,5 +285,5 @@ async function poll() {
         `杀 信号 (>=${HIGHLIGHT}%)`,
         `_有信号时推送，失败继续追踪_`,
     ].join('\n'));
-    poll();
+    poll(); 
 })();

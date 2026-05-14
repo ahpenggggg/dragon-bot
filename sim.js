@@ -117,7 +117,11 @@ const db = {
     peakBalance   : STARTING_BALANCE,
     troughBalance : STARTING_BALANCE,
     busted        : false,
+    globalRetry   : 0,   // global martingale step across all signals
     dayStart      : STARTING_BALANCE,
+    // Global martingale state — tracks losses across signal switches
+    martingaleStep: 0,   // current ladder index
+    martingaleLost: 0,   // total lost in current streak
     dailyTarget   : Math.ceil(STARTING_BALANCE * (1 + DAILY_GROWTH)),
     stopped       : false,
     resumeAt      : null,
@@ -196,16 +200,22 @@ function assignBets(signals) {
     const inRecovery = signals.some(s => (s.consecutiveLoss||0) >= RECOVERY_AFTER);
 
     if (inRecovery) {
-        const deficit = db.peakBalance - db.balance;
-        // Cap pool: keep highest % signals only, max MAX_RECOVERY_SIGS
-        const pool = signals
-            .slice()
-            .sort((a,b) => b.pct-a.pct || b.n-a.n)
-            .slice(0, MAX_RECOVERY_SIGS);
-        // Calculate per signal amount, cap total at MAX_RECOVERY_BET
+        // Pool all recovery signals + new signals
+        const recoverySignals = signals.filter(s => s.recoveryMode || (s.consecutiveLoss||0) >= RECOVERY_AFTER);
+        const newSignals      = signals.filter(s => !s.recoveryMode && (s.consecutiveLoss||0) < RECOVERY_AFTER);
+
+        // Total loss to recover = sum of individual totalLost * 1.1
+        const sumLost     = recoverySignals.reduce((sum, s) => sum + (s.totalLost||0), 0);
+        const deficit     = Math.max(sumLost * 1.1, db.peakBalance - db.balance);
+
+        // Cap pool: recovery signals first, then top new signals, max MAX_RECOVERY_SIGS
+        const pool = [
+            ...recoverySignals.sort((a,b) => b.pct-a.pct || b.n-a.n),
+            ...newSignals.sort((a,b) => b.pct-a.pct || b.n-a.n),
+        ].slice(0, MAX_RECOVERY_SIGS);
+
         let perSig = Math.ceil((deficit / pool.length) / PAYOUT_RATE);
-        const totalBet = perSig * pool.length;
-        if (totalBet > MAX_RECOVERY_BET) {
+        if (perSig * pool.length > MAX_RECOVERY_BET) {
             perSig = Math.floor(MAX_RECOVERY_BET / pool.length);
         }
         perSig = Math.max(perSig, BET_LADDER[0]);
@@ -224,7 +234,7 @@ function assignBets(signals) {
     const paroliBet  = inProfit ? Math.max(Math.min(rawParoli, Math.floor(profit * 0.5)), BET_LADDER[0]) : 0;
 
     if (high.length === 0) {
-        // Prioritise carryover (retryCount > 0) over fresh signals
+        // Pick best signal — carryover first, else fresh
         const carryNormal  = normal.filter(s => s.retryCount > 0).sort((a,b) => b.retryCount-a.retryCount || b.pct-a.pct)[0];
         const freshNormal  = normal.filter(s => s.retryCount === 0).sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
         const best         = carryNormal || freshNormal;
@@ -232,7 +242,8 @@ function assignBets(signals) {
         if (inProfit && (best.consecutiveWin||0) > 0 && (best.consecutiveWin||0) < PAROLI_CAP) {
             amt = paroliBet;
         } else {
-            amt = BET_LADDER[Math.min(best.retryCount, BET_LADDER.length-1)];
+            // Use globalRetry for bet sizing — persists across signal switches
+            amt = BET_LADDER[Math.min(db.globalRetry, BET_LADDER.length-1)];
         }
         result.push({ ...best, betAmt: amt });
     } else {
@@ -456,27 +467,34 @@ async function poll() {
 
             if (!db.busted) {
                 if (hit) {
-                    // Win — drop signal, let fresh evaluation pick next best
+                    // Win — reset global martingale, drop signal
+                    db.globalRetry = 0;
                     if (consecutiveWin >= PAROLI_CAP) {
                         console.log(`  [PAROLI RESET] ${ps.label} 连赢${consecutiveWin}次 重置`);
                     } else {
-                        console.log(`  [WIN DROP] ${ps.label} 已命中，释放信号`);
+                        console.log(`  [WIN DROP] ${ps.label} 已命中，释放信号 globalRetry→0`);
                     }
                 } else if (ps.retryCount+1 >= MAX_RETRIES) {
-                    // Zombie signal — drop it
-                    console.log(`  [DROP] ${ps.label} 超过${MAX_RETRIES}次失败，丢弃`);
+                    // Zombie — drop but keep global retry climbing
+                    db.globalRetry = Math.min(db.globalRetry+1, BET_LADDER.length-1);
+                    console.log(`  [DROP] ${ps.label} 超过${MAX_RETRIES}次失败，丢弃 globalRetry→${db.globalRetry}`);
                 } else {
-                    // 杀 loss — carry forward for martingale
+                    // Loss — increment global retry
+                    db.globalRetry = Math.min(db.globalRetry+1, BET_LADDER.length-1);
+                    const newTotalLost = (ps.totalLost||0)+ps.betAmt;
+                    // If was in recovery, stay in recovery with updated totalLost
+                    const stayRecovery = ps.recoveryMode || (ps.consecutiveLoss||0) >= RECOVERY_AFTER;
                     carryOver.push({
                         ...ps,
-                        retryCount    : ps.retryCount+1,
-                        totalLost     : (ps.totalLost||0)+ps.betAmt,
+                        retryCount      : ps.retryCount+1,
+                        totalLost       : newTotalLost,
                         consecutiveLoss,
-                        consecutiveWin: 0,
-                        lastWinProfit : 0,
-                        recoveryMode  : false,
+                        consecutiveWin  : 0,
+                        lastWinProfit   : 0,
+                        recoveryMode    : stayRecovery,
                         nextIssue,
                     });
+                    console.log(`  [LOSS] globalRetry→${db.globalRetry} recovery:${stayRecovery} totalLost:${newTotalLost}`);
                 }
             }
         }
