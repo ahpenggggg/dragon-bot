@@ -15,8 +15,6 @@ const CHECKS           = [2, 3, 4, 5, 6, 7];
 const BET_LADDER       = [33, 66, 132, 264, 528, 1056];
 const SPLIT_FROM       = 3;  // split from 264 onwards
 const RECOVERY_AFTER   = 4;
-const PAROLI_MULT      = 1.7;
-const PAROLI_CAP       = 3;
 const STARTING_BALANCE = 2000;
 const HARD_CAP_LOSS    = 2000;
 const DAILY_GROWTH     = 0.30;
@@ -185,24 +183,11 @@ function nextResume() {
     return resume;
 }
 
-function currentProfit() {
-    return db.balance - db.dayStart;
-}
-
-function isInProfit() {
-    return db.balance > db.dayStart;
-}
-
 const SMART_RECOVERY_FROM = 2;   // trigger smart recovery from retryCount >= 2 (132+)
 const SPLIT_BET_CAP       = 200; // max per signal before splitting
 
 function assignBets(signals) {
     if (signals.length === 0) return [];
-
-    const profit    = currentProfit();
-    const inProfit  = profit > 0;
-    const rawParoli = inProfit ? Math.ceil(profit * PAROLI_MULT) : 0;
-    const paroliBet = inProfit ? Math.max(Math.min(rawParoli, Math.floor(profit * 0.5)), BET_LADDER[0]) : 0;
 
     const inRecovery      = signals.some(s => s.recoveryMode || (s.consecutiveLoss||0) >= RECOVERY_AFTER);
     const inSmartRecovery = db.globalRetry >= SMART_RECOVERY_FROM;
@@ -247,11 +232,7 @@ function assignBets(signals) {
         const freshNormal = normal.filter(s => s.retryCount === 0).sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
         const best        = carryNormal || freshNormal;
         let amt;
-        if (inProfit && (best.consecutiveWin||0) > 0 && (best.consecutiveWin||0) < PAROLI_CAP) {
-            amt = paroliBet;
-        } else {
-            amt = BET_LADDER[Math.min(db.globalRetry, BET_LADDER.length-1)];
-        }
+        amt = BET_LADDER[Math.min(db.globalRetry, BET_LADDER.length-1)];
         result.push({ ...best, betAmt: amt });
     } else {
         const carryNormal = normal.filter(s => s.retryCount > 0);
@@ -260,11 +241,7 @@ function assignBets(signals) {
         const totalNeeded = Math.max(sumLost*1.1, BET_LADDER[SPLIT_FROM]);
         const basePerSig  = Math.ceil(totalNeeded/pool.length);
         for (const sig of pool) {
-            let amt = basePerSig;
-            if (inProfit && (sig.consecutiveWin||0) > 0 && (sig.consecutiveWin||0) < PAROLI_CAP) {
-                amt = Math.ceil(paroliBet / pool.length);
-            }
-            result.push({ ...sig, betAmt: Math.max(amt, 1) });
+            result.push({ ...sig, betAmt: Math.max(basePerSig, 1) });
         }
     }
     return result;
@@ -305,7 +282,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
         lines.push(`📊 上期验证 (${hits}/${verResults.length} 命中) P&L: ${roundPL>=0?'+':''}${fmt(roundPL)}:`);
         for (const v of verResults) {
             const plStr  = v.hit?`+${fmt(v.betAmt*PAYOUT_RATE)}`:`-${fmt(v.betAmt)}`;
-            const mode   = v.recoveryMode?'🔄':v.consecutiveWin>0?`🔥×${v.consecutiveWin}`:'';
+            const mode   = v.recoveryMode?'🔄':'';
             const aIcon  = v.action==='追'?'🔁':'⚔️';
             lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side} ${v.action}${v.chase}${aIcon} → 实际 *${v.actual}* (${plStr}) ${mode}`);
         }
@@ -314,7 +291,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     lines.push('');
     const todayPL    = db.balance - db.dayStart;
     const targetLeft = Math.max(0, db.dailyTarget-db.balance);
-    const profitMode = isInProfit() ? '📈' : '📉';
+    const profitMode = db.balance > db.dayStart ? '📈' : '📉';
     lines.push(`💰 余额: *${fmt(db.balance)}* | 峰值: ${fmt(db.peakBalance)} | 谷值: ${fmt(db.troughBalance)}`);
     lines.push(`${profitMode} 今日: ${todayPL>=0?'+':''}${fmt(todayPL)} | 目标: ${fmt(db.dailyTarget)} | 还差: ${fmt(targetLeft)}`);
     lines.push(`📊 总投: ${fmt(db.totalBet)} | 赢: +${fmt(db.totalWin)} | 输: -${fmt(db.totalLoss)} | 净: ${db.totalWin-db.totalLoss>=0?'+':''}${fmt(db.totalWin-db.totalLoss)}`);
@@ -334,10 +311,8 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     } else {
         const totalNextBet = bettedSignals.reduce((sum,s)=>sum+s.betAmt,0);
         const isRecovery   = bettedSignals.some(s=>s.recoveryMode);
-        const isParoli     = bettedSignals.some(s=>(s.consecutiveWin||0)>0);
         const highCount    = bettedSignals.filter(s=>s.retryCount>=SPLIT_FROM).length;
-        if (isRecovery)       lines.push(`🔄 *回本模式* 目标: ${fmt(db.peakBalance)}`);
-        else if (isParoli)    lines.push(`🔥 *Paroli 顺风* (盈利中)`);
+        if (isRecovery)       lines.push(`🔄 *回本模式* 目标: ${fmt(db.lastWinBalance+BET_LADDER[0])}`);
         else if (highCount>1) lines.push(`⚠️ _均摊 ×${highCount}_`);
         lines.push('');
         lines.push(`⭐  总注: *${fmt(totalNextBet)}*`);
@@ -345,7 +320,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
 
         for (const sig of bettedSignals) {
             const retry  = sig.retryCount>0?` ❌×${sig.retryCount}`:'';
-            const mode   = sig.recoveryMode?'🔄':(sig.consecutiveWin||0)>0?`🔥×${sig.consecutiveWin}`:'';
+            const mode   = sig.recoveryMode?'🔄':'';
             const aIcon  = sig.action==='追'?'🔁':'⚔️';
             const dim    = db.dims.find(d=>d.id===sig.dimId);
             const sLen   = dim?currentStreakLen(db.rawHistory,dim.fn,sig.side):sig.len;
@@ -456,11 +431,8 @@ async function poll() {
             db.troughBalance = Math.min(db.troughBalance, db.balance);
             db.drawsPlayed++;
 
-            // Paroli win streak only counts when in profit (balance > STARTING_BALANCE)
-            const inProfitNow     = db.balance > db.dayStart;
-            const consecutiveWin  = hit && inProfitNow ? (ps.consecutiveWin||0)+1 : 0;
             const consecutiveLoss = hit?0:(ps.consecutiveLoss||0)+1;
-            verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, action:ps.action, actual, hit, betAmt:ps.betAmt, consecutiveWin:ps.consecutiveWin||0, recoveryMode:ps.recoveryMode||false });
+            verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, action:ps.action, actual, hit, betAmt:ps.betAmt, recoveryMode:ps.recoveryMode||false });
             console.log(`  [${hit?'HIT':'MISS'}] [${ps.action}] ${ps.label} ${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)} inProfit:${inProfitNow}`);
 
             if (db.balance <= STARTING_BALANCE-HARD_CAP_LOSS) {
@@ -473,11 +445,7 @@ async function poll() {
                     // Win — reset global martingale, track last win balance
                     db.globalRetry = 0;
                     db.lastWinBalance = db.balance;
-                    if (consecutiveWin >= PAROLI_CAP) {
-                        console.log(`  [PAROLI RESET] ${ps.label} 连赢${consecutiveWin}次 重置`);
-                    } else {
-                        console.log(`  [WIN DROP] ${ps.label} 已命中，释放信号 globalRetry→0`);
-                    }
+                    console.log(`  [WIN] ${ps.label} 已命中，释放信号`);
                 } else if (ps.retryCount+1 >= MAX_RETRIES) {
                     // Zombie — drop but keep global retry climbing
                     db.globalRetry = Math.min(db.globalRetry+1, BET_LADDER.length-1);
@@ -493,8 +461,6 @@ async function poll() {
                         retryCount      : ps.retryCount+1,
                         totalLost       : newTotalLost,
                         consecutiveLoss,
-                        consecutiveWin  : 0,
-                        lastWinProfit   : 0,
                         recoveryMode    : stayRecovery,
                         nextIssue,
                     });
@@ -526,12 +492,12 @@ async function poll() {
         for (const sig of newSigs) {
             const key = `${sig.dimId}|${sig.side}|${sig.len}|${sig.action}`;
             if (!seen.has(key)) {
-                merged.push({ ...sig, retryCount:0, totalLost:0, consecutiveLoss:0, consecutiveWin:0, lastWinProfit:0, recoveryMode:false, nextIssue });
+                merged.push({ ...sig, retryCount:0, totalLost:0, consecutiveLoss:0, recoveryMode:false, nextIssue });
                 seen.add(key);
             }
         }
 
-        merged.sort((a,b)=>b.retryCount-a.retryCount||b.consecutiveWin-a.consecutiveWin||b.pct-a.pct||b.n-a.n);
+        merged.sort((a,b)=>b.retryCount-a.retryCount||b.pct-a.pct||b.n-a.n);
 
         const bettedSignals = assignBets(merged);
         db.pendingSignals = bettedSignals.map(s=>({ ...s, nextIssue }));
@@ -554,16 +520,14 @@ async function poll() {
 (async()=>{
     console.log('Dragon Sim Bot (杀+追 混合)');
     console.log(`   Chat: ${CHAT_ID}  Threshold: >=${HIGHLIGHT}%  MIN_N: ${MIN_N}  Starting: ${STARTING_BALANCE}`);
-    console.log(`   Ladder: ${BET_LADDER.join('>')}  Split@${BET_LADDER[SPLIT_FROM]}`);
-    console.log(`   Paroli: x${PAROLI_MULT} cap ${PAROLI_CAP} (盈利时才启用)  Recovery after ${RECOVERY_AFTER} losses`);
-    console.log(`   Daily: +${DAILY_GROWTH*100}% target  2pm MYT resume  Rebuild every ${REBUILD_EVERY} draws`);
+    console.log(`   Ladder: ${BET_LADDER.join('>')}  Split@${BET_LADDER[SPLIT_FROM]}  SmartRecovery@${BET_LADDER[SMART_RECOVERY_FROM]}`);
+     console.log(`   Daily: +${DAILY_GROWTH*100}% target  2pm MYT resume  Rebuild every ${REBUILD_EVERY} draws`);
     console.log('');
     try{await init();}catch(e){console.error('[init error]',e.message);process.exit(1);}
     send([
         `🐲 *Dragon Sim Bot 已启动 (杀+追)*`,
         `💰 余额: *${STARTING_BALANCE}*  🎯 目标: *${Math.ceil(STARTING_BALANCE*(1+DAILY_GROWTH))}*`,
-        `🪜 梯注: ${BET_LADDER.join('→')}  分拆@${BET_LADDER[SPLIT_FROM]}`,
-        `🔥 Paroli ×${PAROLI_MULT} 最多${PAROLI_CAP}连赢 (盈利才启用)`,
+        `🪜 梯注: ${BET_LADDER.join('→')}  分拆@${BET_LADDER[SPLIT_FROM]} (智能回本)`,
         `🔄 连败${RECOVERY_AFTER}次→回本模式`,
         `🔁 每${REBUILD_EVERY}期刷新信号表`,
         `🎯 达标停止，次日2pm MYT恢复`,
