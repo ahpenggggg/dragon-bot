@@ -118,6 +118,7 @@ const db = {
     troughBalance : STARTING_BALANCE,
     busted        : false,
     globalRetry   : 0,   // global martingale step across all signals
+    lastWinBalance: STARTING_BALANCE, // balance at last win
     dayStart      : STARTING_BALANCE,
     // Global martingale state — tracks losses across signal switches
     martingaleStep: 0,   // current ladder index
@@ -152,23 +153,21 @@ function evaluateSignals() {
         const bPct  = Math.round(s.break/s.total*100);
         const cPct  = 100 - bPct;
 
-        if (streakLen >= 7) {
-            // Long streak (>=7) — switch to 追, bet on continuation
-            if (cPct >= HIGHLIGHT) {
-                const key = `${dim.id}|${lastVal}|${streakLen}|追`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
-                }
+        // 追 only when historical cont% >= 65% with solid sample (n >= 15)
+        // Not based on streak length — mathematically streak length has no edge
+        if (cPct >= 70 && s.total >= 15) {
+            const key = `${dim.id}|${lastVal}|${streakLen}|追`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
             }
-        } else {
-            // Normal — 杀, bet on break
-            if (bPct >= HIGHLIGHT) {
-                const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
-                }
+        }
+        // 杀 when historical break% >= HIGHLIGHT
+        if (bPct >= HIGHLIGHT) {
+            const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
             }
         }
     }
@@ -194,61 +193,67 @@ function isInProfit() {
     return db.balance > db.dayStart;
 }
 
+const SMART_RECOVERY_FROM = 2;   // trigger smart recovery from retryCount >= 2 (132+)
+const SPLIT_BET_CAP       = 200; // max per signal before splitting
+
 function assignBets(signals) {
     if (signals.length === 0) return [];
 
-    const inRecovery = signals.some(s => (s.consecutiveLoss||0) >= RECOVERY_AFTER);
+    const profit    = currentProfit();
+    const inProfit  = profit > 0;
+    const rawParoli = inProfit ? Math.ceil(profit * PAROLI_MULT) : 0;
+    const paroliBet = inProfit ? Math.max(Math.min(rawParoli, Math.floor(profit * 0.5)), BET_LADDER[0]) : 0;
 
-    if (inRecovery) {
-        // Pool all recovery signals + new signals
-        const recoverySignals = signals.filter(s => s.recoveryMode || (s.consecutiveLoss||0) >= RECOVERY_AFTER);
-        const newSignals      = signals.filter(s => !s.recoveryMode && (s.consecutiveLoss||0) < RECOVERY_AFTER);
+    const inRecovery      = signals.some(s => s.recoveryMode || (s.consecutiveLoss||0) >= RECOVERY_AFTER);
+    const inSmartRecovery = db.globalRetry >= SMART_RECOVERY_FROM;
 
-        // Total loss to recover = sum of individual totalLost * 1.1
-        const sumLost     = recoverySignals.reduce((sum, s) => sum + (s.totalLost||0), 0);
-        const deficit     = Math.max(sumLost * 1.1, db.peakBalance - db.balance);
+    if (inRecovery || inSmartRecovery) {
+        // Target: recover to lastWinBalance + 1 unit
+        const target  = db.lastWinBalance + BET_LADDER[0];
+        const deficit = Math.max(target - db.balance, 0);
 
-        // Cap pool: recovery signals first, then top new signals, max MAX_RECOVERY_SIGS
-        const pool = [
-            ...recoverySignals.sort((a,b) => b.pct-a.pct || b.n-a.n),
-            ...newSignals.sort((a,b) => b.pct-a.pct || b.n-a.n),
-        ].slice(0, MAX_RECOVERY_SIGS);
+        const allSorted = signals.slice().sort((a,b) => b.pct-a.pct || b.n-a.n);
+        const singleBet = Math.ceil(deficit / PAYOUT_RATE);
 
-        let perSig = Math.ceil((deficit / pool.length) / PAYOUT_RATE);
-        if (perSig * pool.length > MAX_RECOVERY_BET) {
-            perSig = Math.floor(MAX_RECOVERY_BET / pool.length);
+        if (deficit === 0 || singleBet <= BET_LADDER[0]) {
+            // Already recovered or tiny deficit — reset and fresh bet
+            db.globalRetry = 0;
+            const best = allSorted[0];
+            return [{ ...best, betAmt: BET_LADDER[0], recoveryMode: false }];
+        } else if (singleBet <= SPLIT_BET_CAP || allSorted.length === 1) {
+            // Single bet covers it within cap
+            const best = allSorted[0];
+            return [{ ...best, betAmt: singleBet, recoveryMode: true }];
+        } else {
+            // Need to split — find how many signals to keep each <= SPLIT_BET_CAP
+            const numNeeded = Math.min(
+                Math.ceil(singleBet / SPLIT_BET_CAP),
+                Math.min(allSorted.length, MAX_RECOVERY_SIGS)
+            );
+            const pool  = allSorted.slice(0, numNeeded);
+            let perSig  = Math.ceil((deficit / pool.length) / PAYOUT_RATE);
+            perSig      = Math.max(perSig, BET_LADDER[0]);
+            return pool.map(s => ({ ...s, betAmt: perSig, recoveryMode: true }));
         }
-        perSig = Math.max(perSig, BET_LADDER[0]);
-        return pool.map(s => ({ ...s, betAmt: perSig, recoveryMode: true }));
     }
 
+    // Normal betting
     const normal = signals.filter(s => s.retryCount < SPLIT_FROM);
     const high   = signals.filter(s => s.retryCount >= SPLIT_FROM);
     const result = [];
 
-    // Paroli bet = actual profit above dayStart * PAROLI_MULT
-    // Capped at 50% of current profit to always protect at least half the gains
-    const profit     = currentProfit();
-    const inProfit   = profit > 0;
-    const rawParoli  = inProfit ? Math.ceil(profit * PAROLI_MULT) : 0;
-    const paroliBet  = inProfit ? Math.max(Math.min(rawParoli, Math.floor(profit * 0.5)), BET_LADDER[0]) : 0;
-
     if (high.length === 0) {
-        // Pick best signal — carryover first, else fresh
-        const carryNormal  = normal.filter(s => s.retryCount > 0).sort((a,b) => b.retryCount-a.retryCount || b.pct-a.pct)[0];
-        const freshNormal  = normal.filter(s => s.retryCount === 0).sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
-        const best         = carryNormal || freshNormal;
+        const carryNormal = normal.filter(s => s.retryCount > 0).sort((a,b) => b.retryCount-a.retryCount || b.pct-a.pct)[0];
+        const freshNormal = normal.filter(s => s.retryCount === 0).sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
+        const best        = carryNormal || freshNormal;
         let amt;
         if (inProfit && (best.consecutiveWin||0) > 0 && (best.consecutiveWin||0) < PAROLI_CAP) {
             amt = paroliBet;
         } else {
-            // Use globalRetry for bet sizing — persists across signal switches
             amt = BET_LADDER[Math.min(db.globalRetry, BET_LADDER.length-1)];
         }
         result.push({ ...best, betAmt: amt });
     } else {
-        // Only include fresh signals in split pool if they are carryovers too
-        // Fresh (retryCount=0) signals don't join the high-tier split pool
         const carryNormal = normal.filter(s => s.retryCount > 0);
         const pool        = [...high, ...carryNormal];
         const sumLost     = high.reduce((sum, s) => sum+(s.totalLost||0), 0);
@@ -302,8 +307,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
             const plStr  = v.hit?`+${fmt(v.betAmt*PAYOUT_RATE)}`:`-${fmt(v.betAmt)}`;
             const mode   = v.recoveryMode?'🔄':v.consecutiveWin>0?`🔥×${v.consecutiveWin}`:'';
             const aIcon  = v.action==='追'?'🔁':'⚔️';
-            const longV  = v.action==='追'?' 🐉':'';
-            lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side}${longV} ${v.action}${v.chase}${aIcon} → 实际 *${v.actual}* (${plStr}) ${mode}`);
+            lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side} ${v.action}${v.chase}${aIcon} → 实际 *${v.actual}* (${plStr}) ${mode}`);
         }
     }
 
@@ -345,8 +349,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
             const aIcon  = sig.action==='追'?'🔁':'⚔️';
             const dim    = db.dims.find(d=>d.id===sig.dimId);
             const sLen   = dim?currentStreakLen(db.rawHistory,dim.fn,sig.side):sig.len;
-            const longTag = sig.action==='追' && sLen>=7 ? ' 🐉长龙' : '';
-            lines.push(`${sig.label} 连${sLen}${sig.side}${retry}${longTag} ${mode}`);
+            lines.push(`${sig.label} 连${sLen}${sig.side}${retry} ${mode}`);
             lines.push(`${sig.action}${sig.chase}${aIcon}  下注 *${fmt(sig.betAmt)}*  _(${sig.pct}% n=${sig.n})_`);
             lines.push('');
         }
@@ -467,8 +470,9 @@ async function poll() {
 
             if (!db.busted) {
                 if (hit) {
-                    // Win — reset global martingale, drop signal
+                    // Win — reset global martingale, track last win balance
                     db.globalRetry = 0;
+                    db.lastWinBalance = db.balance;
                     if (consecutiveWin >= PAROLI_CAP) {
                         console.log(`  [PAROLI RESET] ${ps.label} 连赢${consecutiveWin}次 重置`);
                     } else {
