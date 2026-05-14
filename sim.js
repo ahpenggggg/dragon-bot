@@ -433,7 +433,7 @@ async function poll() {
 
             const consecutiveLoss = hit?0:(ps.consecutiveLoss||0)+1;
             verResults.push({ label:ps.label, side:ps.side, streakLen:ps.len, chase:ps.chase, action:ps.action, actual, hit, betAmt:ps.betAmt, recoveryMode:ps.recoveryMode||false });
-            console.log(`  [${hit?'HIT':'MISS'}] [${ps.action}] ${ps.label} ${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)} inProfit:${inProfitNow}`);
+            console.log(`  [${hit?'HIT':'MISS'}] [${ps.action}] ${ps.label} ${ps.chase} → ${actual} | bet:${ps.betAmt} bal:${fmt(db.balance)}`);
 
             if (db.balance <= STARTING_BALANCE-HARD_CAP_LOSS) {
                 db.busted = true;
