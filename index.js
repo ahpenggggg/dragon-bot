@@ -96,18 +96,40 @@ const db = {
     pendingSignals: [],
 };
 
+// Dynamic evaluation — live streak lookup, fires every draw
+const DYNAMIC_HIGHLIGHT = 70; // higher threshold for index bot
+const DYNAMIC_MIN_N     = 7;
+const DYNAMIC_MIN_STREAK = 3;
+
 function evaluateSignals() {
     const active = [];
     const seen   = new Set();
-    for (const sig of db.signalTable) {
-        const key = `${sig.dimId}|${sig.side}|${sig.len}|${sig.action}`;
-        if (seen.has(key)) continue;
-        const dim = db.dims.find(d=>d.id===sig.dimId);
-        if (!dim) continue;
-        if (!matchesStreak(db.rawHistory, dim.fn, sig.side, sig.len)) continue;
-        seen.add(key);
-        active.push(sig);
+
+    for (const dim of db.dims) {
+        if (db.rawHistory.length === 0) continue;
+        const lastVal   = dim.fn(db.rawHistory[db.rawHistory.length-1]);
+        const streakLen = currentStreakLen(db.rawHistory, dim.fn, lastVal);
+        if (streakLen < DYNAMIC_MIN_STREAK) continue;
+
+        const vals = db.rawHistory.map(dim.fn);
+        const res  = countStreakFollowup(vals, streakLen);
+        const s    = res.bySide[lastVal];
+        if (!s || s.total < DYNAMIC_MIN_N) continue;
+
+        const pair = dim.id.includes('DS')?['单','双']:['大','小'];
+        const opp  = pair.find(x=>x!==lastVal);
+        const bPct = Math.round(s.break/s.total*100);
+
+        if (bPct >= DYNAMIC_HIGHLIGHT) {
+            const key = `${dim.id}|${lastVal}|${streakLen}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
+            }
+        }
     }
+
+    active.sort((a,b)=>b.pct-a.pct||b.n-a.n);
     return active;
 }
 
@@ -285,5 +307,5 @@ async function poll() {
         `杀 信号 (>=${HIGHLIGHT}%)`,
         `_有信号时推送，失败继续追踪_`,
     ].join('\n'));
-    poll(); 
+    poll();
 })();
