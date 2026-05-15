@@ -3,16 +3,21 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const axios       = require('axios');
 
+// Real betting — set LIVE_BET=true in .env to enable
+const { placeBets, testSession } = require('./bet');
+const LIVE_BET = process.env.LIVE_BET === 'true';
+
 const BOT_TOKEN = process.env.SIM_BOT_TOKEN || 'YOUR_SIM_BOT_TOKEN_HERE';
 const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_SIM_CHAT_ID_HERE';
 
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
-const HIGHLIGHT        = 65;
+const HIGHLIGHT        = 55;
 const MIN_N            = 5;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
-const BET_LADDER       = [33, 66, 132, 264, 528, 1056];
+// const BET_LADDER    = [33, 66, 132, 264, 528, 1056]; // original 33 base
+const BET_LADDER       = [15, 30, 60, 120, 240, 480];
 const RECOVERY_AFTER   = 4;
 const SPLIT_FROM       = 3;  // normal split threshold (index into ladder)
 const MAX_RECOVERY_SIGS = 6; // max signals in smart recovery pool
@@ -520,6 +525,17 @@ async function poll() {
             console.log('  [silent] no signals');
         }
 
+        // Place real bets if live mode enabled
+        if (LIVE_BET && bettedSignals.length > 0) {
+            placeBets(bettedSignals, nextIssue).then(result => {
+                if (!result.success) {
+                    send(`⚠️ *下注失败!*\n\`${JSON.stringify(result.error)}\``);
+                }
+            }).catch(err => {
+                send(`⚠️ *下注异常!*\n\`${err.message}\``);
+            });
+        }
+
         if (verResults.length>0 || bettedSignals.length>0) {
             send(buildMsg(raw, bettedSignals, verResults, nextIssue));
         }
@@ -538,6 +554,14 @@ async function poll() {
      console.log(`   Daily: +${DAILY_GROWTH*100}% target  2pm MYT resume  Rebuild every ${REBUILD_EVERY} draws`);
     console.log('');
     try{await init();}catch(e){console.error('[init error]',e.message);process.exit(1);}
+    if (LIVE_BET) {
+        console.log('[live] LIVE_BET enabled — testing session...');
+        const ok = await testSession();
+        if (!ok) { console.error('[live] Session invalid — set SITE_JSESSIONID and SITE_TOKEN in .env'); process.exit(1); }
+        console.log('[live] Session valid ✅');
+    } else {
+        console.log('[live] LIVE_BET disabled — simulation mode only');
+    }
     send([
         `🐲 *Dragon Sim Bot 已启动 (杀+追)*`,
         `💰 余额: *${STARTING_BALANCE}*  🎯 目标: *${Math.ceil(STARTING_BALANCE*(1+DAILY_GROWTH))}*`,
