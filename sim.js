@@ -444,8 +444,11 @@ async function poll() {
                 if (hit) {
                     // Win — reset global martingale, track last win balance
                     db.globalRetry = 0;
-                    db.lastWinBalance = db.balance;
-                    console.log(`  [WIN] ${ps.label} 已命中，释放信号`);
+                    // Only update lastWinBalance if not in recovery (full clean win)
+                    if (!ps.recoveryMode) {
+                        db.lastWinBalance = db.balance;
+                    }
+                    console.log(`  [WIN] ${ps.label} 已命中 recovery:${ps.recoveryMode} lastWin:${fmt(db.lastWinBalance)}`);
                 } else if (ps.retryCount+1 >= MAX_RETRIES) {
                     // Zombie — drop but keep global retry climbing
                     db.globalRetry = Math.min(db.globalRetry+1, BET_LADDER.length-1);
@@ -473,6 +476,15 @@ async function poll() {
             send(buildMsg(raw, [], verResults, nextIssue));
             setTimeout(poll,nextMs);
             return;
+        }
+
+        // If all recovery signals hit this round → full recovery, update lastWinBalance
+        const recoveryRound = verResults.some(v => v.recoveryMode);
+        const allRecoveryHit = recoveryRound && verResults.filter(v=>v.recoveryMode).every(v=>v.hit);
+        if (allRecoveryHit) {
+            db.lastWinBalance = db.balance;
+            db.globalRetry = 0;
+            console.log(`  [RECOVERY COMPLETE] lastWinBalance→${fmt(db.lastWinBalance)}`);
         }
 
         if (db.balance >= db.dailyTarget) {
