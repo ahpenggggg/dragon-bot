@@ -13,16 +13,15 @@ const HIGHLIGHT        = 55;
 const MIN_N            = 5;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
 const BET_LADDER       = [33, 66, 132, 264, 528, 1056];
-const SPLIT_FROM       = 3;  // split from 264 onwards
 const RECOVERY_AFTER   = 4;
+const SPLIT_FROM       = 3;  // normal split threshold (index into ladder)
+const MAX_RECOVERY_SIGS = 6; // max signals in smart recovery pool
 const STARTING_BALANCE = 2000;
 const HARD_CAP_LOSS    = 2000;
 const DAILY_GROWTH     = 0.30;
 const RESUME_HOUR_MYT  = 14;
 const REBUILD_EVERY    = 25;
 const PAYOUT_RATE      = 0.96;
-const MAX_RECOVERY_SIGS = 6;    // max signals in recovery pool
-const MAX_RECOVERY_BET  = 400;  // max total bet in recovery per round
 const MAX_RETRIES       = 5;    // drop signal after this many losses
 
 const posLabels = ['冠军','亚军','第三','第四','第五','第六','第七','第八','第九','第十'];
@@ -116,11 +115,8 @@ const db = {
     troughBalance : STARTING_BALANCE,
     busted        : false,
     globalRetry   : 0,   // global martingale step across all signals
-    lastWinBalance: STARTING_BALANCE, // balance at last win
+    lastWinBalance: STARTING_BALANCE, // balance at last clean win
     dayStart      : STARTING_BALANCE,
-    // Global martingale state — tracks losses across signal switches
-    martingaleStep: 0,   // current ladder index
-    martingaleLost: 0,   // total lost in current streak
     dailyTarget   : Math.ceil(STARTING_BALANCE * (1 + DAILY_GROWTH)),
     stopped       : false,
     resumeAt      : null,
@@ -189,10 +185,12 @@ const SPLIT_BET_CAP       = 200; // max per signal before splitting
 function assignBets(signals) {
     if (signals.length === 0) return [];
 
-    const inRecovery      = signals.some(s => s.recoveryMode || (s.consecutiveLoss||0) >= RECOVERY_AFTER);
-    const inSmartRecovery = db.globalRetry >= SMART_RECOVERY_FROM;
+    // Single recovery trigger: globalRetry >= SMART_RECOVERY_FROM (132+)
+    // or any signal already in recoveryMode from previous round
+    const inRecovery = db.globalRetry >= SMART_RECOVERY_FROM ||
+                       signals.some(s => s.recoveryMode);
 
-    if (inRecovery || inSmartRecovery) {
+    if (inRecovery) {
         // Target: recover to lastWinBalance + 1 unit
         const target  = db.lastWinBalance + BET_LADDER[0];
         const deficit = Math.max(target - db.balance, 0);
@@ -462,7 +460,7 @@ async function poll() {
                     db.globalRetry = Math.min(db.globalRetry+1, BET_LADDER.length-1);
                     const newTotalLost = (ps.totalLost||0)+ps.betAmt;
                     // If was in recovery, stay in recovery with updated totalLost
-                    const stayRecovery = ps.recoveryMode || (ps.consecutiveLoss||0) >= RECOVERY_AFTER;
+                    const stayRecovery = ps.recoveryMode || db.globalRetry >= SMART_RECOVERY_FROM;
                     carryOver.push({
                         ...ps,
                         retryCount      : ps.retryCount+1,
@@ -544,7 +542,7 @@ async function poll() {
         `🐲 *Dragon Sim Bot 已启动 (杀+追)*`,
         `💰 余额: *${STARTING_BALANCE}*  🎯 目标: *${Math.ceil(STARTING_BALANCE*(1+DAILY_GROWTH))}*`,
         `🪜 梯注: ${BET_LADDER.join('→')}  分拆@${BET_LADDER[SPLIT_FROM]} (智能回本)`,
-        `🔄 连败${RECOVERY_AFTER}次→回本模式`,
+        `🔄 智能回本: 第3次失败后(132+)精确计算回本注`,
         `🔁 每${REBUILD_EVERY}期刷新信号表`,
         `🎯 达标停止，次日2pm MYT恢复`,
         `🛑 硬顶: 亏损${HARD_CAP_LOSS}永久停止`,
