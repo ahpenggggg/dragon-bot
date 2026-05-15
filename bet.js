@@ -79,6 +79,10 @@ async function fetchOdds() {
         headers: { ...HEADERS, Cookie: getCookieHeader() },
         timeout: 10_000,
     });
+    // Detect HTML response = session expired
+    if (typeof res.data === 'string' && res.data.includes('<!DOCTYPE')) {
+        throw new Error('SESSION_EXPIRED');
+    }
     return res.data;
 }
 
@@ -96,9 +100,7 @@ async function fetchBalance() {
 async function placeBets(signals, drawNumber) {
     const odds = await fetchOdds();
 
-    console.log('[bet] Odds response type:', typeof odds);
-    console.log('[bet] Odds keys:', Object.keys(odds||{}).filter(k => k.startsWith('DS') || k.startsWith('DX')).join(', '));
-    console.log('[bet] Full odds sample:', JSON.stringify(odds).slice(0, 200));
+
 
     const bets = [];
     for (const sig of signals) {
@@ -143,6 +145,10 @@ async function placeBets(signals, drawNumber) {
             headers: { ...HEADERS, Cookie: getCookieHeader() },
             timeout: 10_000,
         });
+        // Detect HTML response = session expired
+        if (typeof res.data === 'string' && res.data.includes('<!DOCTYPE')) {
+            return { success: false, error: 'SESSION_EXPIRED' };
+        }
         console.log(`[bet] Response:`, JSON.stringify(res.data));
         return { success: true, data: res.data, bets };
     } catch (err) {

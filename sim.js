@@ -4,7 +4,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios       = require('axios');
 
 // Real betting — set LIVE_BET=true in .env to enable
-const { placeBets, testSession } = require('./bet');
+const { placeBets, testSession, updateSession } = require('./bet');
 const LIVE_BET = process.env.LIVE_BET === 'true';
 
 const BOT_TOKEN = process.env.SIM_BOT_TOKEN || 'YOUR_SIM_BOT_TOKEN_HERE';
@@ -257,11 +257,38 @@ function secsToNext() {
 const PAD2 = n=>String(n).padStart(2,' ');
 const fmt  = n=>n.toFixed(0);
 
-const bot = new TelegramBot(BOT_TOKEN,{polling:false});
+const bot = new TelegramBot(BOT_TOKEN,{polling:true});
 function send(text) {
     return bot.sendMessage(CHAT_ID,text,{parse_mode:'Markdown',disable_web_page_preview:true})
               .catch(err=>console.error('[send error]',err.message));
 }
+
+// /session JSESSIONID TOKEN — update site session cookies at runtime
+bot.onText(/\/session\s+(\S+)\s+(\S+)/, async (msg, match) => {
+    if (String(msg.chat.id) !== String(CHAT_ID)) return;
+    const jsessionid = match[1];
+    const token      = match[2];
+    updateSession(jsessionid, token);
+    const ok = await testSession();
+    if (ok) {
+        send(`✅ *Session updated!* Bot will now place real bets.`);
+    } else {
+        send(`❌ *Session invalid!* Check JSESSIONID and token.`);
+    }
+});
+
+// /liveon and /liveoff — toggle live betting at runtime
+let liveBetEnabled = process.env.LIVE_BET === 'true';
+bot.onText(/\/liveon/, msg => {
+    if (String(msg.chat.id) !== String(CHAT_ID)) return;
+    liveBetEnabled = true;
+    send(`✅ *Live betting ON* — real bets will be placed.`);
+});
+bot.onText(/\/liveoff/, msg => {
+    if (String(msg.chat.id) !== String(CHAT_ID)) return;
+    liveBetEnabled = false;
+    send(`⏸ *Live betting OFF* — simulation only.`);
+});
 
 function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     const nums  = raw.preDrawCode.split(',').map(Number);
@@ -526,13 +553,23 @@ async function poll() {
         }
 
         // Place real bets if live mode enabled
-        if (LIVE_BET && bettedSignals.length > 0) {
+        if (liveBetEnabled && bettedSignals.length > 0) {
             placeBets(bettedSignals, nextIssue).then(result => {
                 if (!result.success) {
-                    send(`⚠️ *下注失败!*\n\`${JSON.stringify(result.error)}\``);
+                    if (result.error === 'SESSION_EXPIRED') {
+                        liveBetEnabled = false;
+                        send(`🔐 *Session过期！下注已暂停*\n请重新登录后发送:\n\`/session JSESSIONID TOKEN\``);
+                    } else {
+                        send(`⚠️ *下注失败!*\n\`${JSON.stringify(result.error)}\``);
+                    }
                 }
             }).catch(err => {
-                send(`⚠️ *下注异常!*\n\`${err.message}\``);
+                if (err.message === 'SESSION_EXPIRED') {
+                    liveBetEnabled = false;
+                    send(`🔐 *Session过期！下注已暂停*\n请重新登录后发送:\n\`/session JSESSIONID TOKEN\``);
+                } else {
+                    send(`⚠️ *下注异常!*\n\`${err.message}\``);
+                }
             });
         }
 
