@@ -449,6 +449,10 @@ async function poll() {
                         db.lastWinBalance = db.balance;
                     }
                     console.log(`  [WIN] ${ps.label} 已命中 recovery:${ps.recoveryMode} lastWin:${fmt(db.lastWinBalance)}`);
+                } else if (ps.action === '追') {
+                    // 追 signal lost — streak broke, drop immediately
+                    db.globalRetry = Math.min(db.globalRetry+1, BET_LADDER.length-1);
+                    console.log(`  [DROP] ${ps.label} 追信号失败，丢弃 globalRetry→${db.globalRetry}`);
                 } else if (ps.retryCount+1 >= MAX_RETRIES) {
                     // Zombie — drop but keep global retry climbing
                     db.globalRetry = Math.min(db.globalRetry+1, BET_LADDER.length-1);
