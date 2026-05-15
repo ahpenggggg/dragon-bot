@@ -5,12 +5,22 @@ const axios = require('axios');
 const SITE_BASE = `https://${process.env.SITE_HOST || '0348751692-kb.tcr195uhyru.com'}`;
 const LOTTERY   = 'PK10JSC';
 
-// Session cookies — set via env vars, refresh manually on expiry
-// SITE_JSESSIONID and SITE_TOKEN from .env
+// Session cookies — updatable at runtime via /session command
+let sessionCookies = {
+    JSESSIONID: process.env.SITE_JSESSIONID || '',
+    token      : process.env.SITE_TOKEN      || '',
+};
+
+function updateSession(jsessionid, token) {
+    sessionCookies.JSESSIONID = jsessionid;
+    sessionCookies.token      = token;
+    console.log(`[bet] Session updated: JSESSIONID=${jsessionid.slice(0,8)}...`);
+}
+
 function getCookieHeader() {
     return [
-        `JSESSIONID=${process.env.SITE_JSESSIONID}`,
-        `token=${process.env.SITE_TOKEN}`,
+        `JSESSIONID=${sessionCookies.JSESSIONID}`,
+        `token=${sessionCookies.token}`,
         `lang=zh_CN`,
         `defaultLT=${LOTTERY}`,
     ].join('; ');
@@ -26,23 +36,23 @@ const HEADERS = {
 // dimId: p{pos}DS or p{pos}DX
 // chase: 单/双/大/小
 function signalToGame(sig) {
-    const pos = parseInt(sig.dimId.replace('p','').replace('DS','').replace('DX',''));
-    const isDS = sig.dimId.includes('DS');
-    const isDX = sig.dimId.includes('DX');
+    // dimId format: p6DS, p7DX, p10DS etc
+    const isDS = sig.dimId.endsWith('DS');
+    const isDX = sig.dimId.endsWith('DX');
+    const pos  = parseInt(sig.dimId.slice(1, sig.dimId.length - 2)); // strip leading 'p' and trailing 'DS'/'DX'
+
+    console.log(`[bet] signalToGame: dimId=${sig.dimId} pos=${pos} isDS=${isDS} isDX=${isDX} chase=${sig.chase}`);
 
     if (isDS) {
-        return {
-            game    : `DS${pos}`,
-            contents: sig.chase === '单' ? 'S' : 'D',
-            title   : `第${pos}名`,
-        };
+        const contents = sig.chase === '单' ? 'S' : 'D';
+        console.log(`[bet] → game=DS${pos} contents=${contents} key=DS${pos}_${contents}`);
+        return { game: `DS${pos}`, contents, title: `第${pos}名` };
     } else if (isDX) {
-        return {
-            game    : `DX${pos}`,
-            contents: sig.chase === '大' ? 'D' : 'X',
-            title   : `第${pos}名`,
-        };
+        const contents = sig.chase === '大' ? 'D' : 'X';
+        console.log(`[bet] → game=DX${pos} contents=${contents} key=DX${pos}_${contents}`);
+        return { game: `DX${pos}`, contents, title: `第${pos}名` };
     }
+    console.log(`[bet] → NO MATCH for dimId=${sig.dimId}`);
     return null;
 }
 
@@ -57,8 +67,15 @@ async function fetchPeriod() {
 }
 
 async function fetchOdds() {
+    const games = [
+        'DX1','DX2','DX3','DX4','DX5','DX6','DX7','DX8','DX9','DX10',
+        'DS1','DS2','DS3','DS4','DS5','DS6','DS7','DS8','DS9','DS10',
+        'GDX','GDS','LH1','LH2','LH3','LH4','LH5',
+        'B1','B2','B3','B4','B5','B6','B7','B8','B9','B10',
+        'GYH','DLDH','XYLH','XYLH8',
+    ].join(',');
     const res = await axios.get(`${SITE_BASE}/member/odds`, {
-        params : { lottery: LOTTERY, games: 'DS1,DS2,DS3,DS4,DS5,DS6,DS7,DS8,DS9,DS10,DX1,DX2,DX3,DX4,DX5,DX6,DX7,DX8,DX9,DX10' },
+        params : { lottery: LOTTERY, games },
         headers: { ...HEADERS, Cookie: getCookieHeader() },
         timeout: 10_000,
     });
@@ -78,6 +95,10 @@ async function fetchBalance() {
 // drawNumber: current draw number to bet on
 async function placeBets(signals, drawNumber) {
     const odds = await fetchOdds();
+
+    console.log('[bet] Odds response type:', typeof odds);
+    console.log('[bet] Odds keys:', Object.keys(odds||{}).filter(k => k.startsWith('DS') || k.startsWith('DX')).join(', '));
+    console.log('[bet] Full odds sample:', JSON.stringify(odds).slice(0, 200));
 
     const bets = [];
     for (const sig of signals) {
@@ -143,4 +164,4 @@ async function testSession() {
     }
 }
 
-module.exports = { placeBets, fetchPeriod, fetchBalance, testSession };
+module.exports = { placeBets, fetchPeriod, fetchBalance, testSession, updateSession };
