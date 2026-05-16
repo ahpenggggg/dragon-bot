@@ -12,17 +12,20 @@ const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=
 const HIGHLIGHT        = 60;
 const MIN_N            = 6;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
-const BET_LADDER       = [33, 66, 132, 264, 528, 1056];
+const BET_LADDER       = [25, 50, 100, 200, 400, 800];  // 25 base (recommended)
 const RECOVERY_AFTER   = 4;
-const SPLIT_FROM       = 3;  // normal split threshold (index into ladder)
-const MAX_RECOVERY_SIGS = 6; // max signals in smart recovery pool
+const SPLIT_FROM       = 3;
+const MAX_RECOVERY_SIGS = 6;
 const STARTING_BALANCE = 2000;
 const HARD_CAP_LOSS    = 2000;
 const DAILY_GROWTH     = 0.30;
 const RESUME_HOUR_MYT  = 14;
 const REBUILD_EVERY    = 25;
 const PAYOUT_RATE      = 0.96;
-const MAX_RETRIES       = 5;    // drop signal after this many losses
+const MAX_RETRIES      = 5;
+const SMART_RECOVERY_FROM = 2;
+const SPLIT_BET_CAP       = 200;
+const MAX_RECOVERY_ROUNDS = 3;
 
 const posLabels = ['冠军','亚军','第三','第四','第五','第六','第七','第八','第九','第十'];
 
@@ -58,7 +61,6 @@ function countStreakFollowup(vals, streakLen) {
     return res;
 }
 
-// Build signal table: DT=追 only, others=杀+追
 function buildSignalTable(rawRecords) {
     const dims = buildDimensions();
     const sigs = [];
@@ -114,29 +116,26 @@ const db = {
     peakBalance   : STARTING_BALANCE,
     troughBalance : STARTING_BALANCE,
     busted        : false,
-    globalRetry   : 0,   // global martingale step across all signals
-    lastWinBalance: STARTING_BALANCE, // balance at last clean win
+    globalRetry   : 0,
+    lastWinBalance: STARTING_BALANCE,
+    recoveryRounds: 0,
     dayStart      : STARTING_BALANCE,
     dailyTarget   : Math.ceil(STARTING_BALANCE * (1 + DAILY_GROWTH)),
     stopped       : false,
     resumeAt      : null,
 };
 
-// Dynamic signal evaluation — check live streak for every dimension,
-// look up historical break/continue rate for that exact streak length
 function evaluateSignals() {
     const active = [];
     const seen   = new Set();
     const MIN_STREAK = 3;
 
     for (const dim of db.dims) {
-        // Find current streak side and length
         if (db.rawHistory.length === 0) continue;
-        const lastVal = dim.fn(db.rawHistory[db.rawHistory.length-1]);
+        const lastVal   = dim.fn(db.rawHistory[db.rawHistory.length-1]);
         const streakLen = currentStreakLen(db.rawHistory, dim.fn, lastVal);
         if (streakLen < MIN_STREAK) continue;
 
-        // Look up historical stats for this exact streak length
         const vals = db.rawHistory.map(dim.fn);
         const res  = countStreakFollowup(vals, streakLen);
         const s    = res.bySide[lastVal];
@@ -147,8 +146,6 @@ function evaluateSignals() {
         const bPct  = Math.round(s.break/s.total*100);
         const cPct  = 100 - bPct;
 
-        // 追 only when historical cont% >= 65% with solid sample (n >= 15)
-        // Not based on streak length — mathematically streak length has no edge
         if (cPct >= 70 && s.total >= 15) {
             const key = `${dim.id}|${lastVal}|${streakLen}|追`;
             if (!seen.has(key)) {
@@ -156,7 +153,6 @@ function evaluateSignals() {
                 active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'追', chase:lastVal, pct:cPct, n:s.total });
             }
         }
-        // 杀 when historical break% >= HIGHLIGHT
         if (bPct >= HIGHLIGHT) {
             const key = `${dim.id}|${lastVal}|${streakLen}|杀`;
             if (!seen.has(key)) {
@@ -166,7 +162,6 @@ function evaluateSignals() {
         }
     }
 
-    // Sort by pct desc
     active.sort((a,b)=>b.pct-a.pct||b.n-a.n);
     return active;
 }
@@ -179,36 +174,26 @@ function nextResume() {
     return resume;
 }
 
-const SMART_RECOVERY_FROM = 2;   // trigger smart recovery from retryCount >= 2 (132+)
-const SPLIT_BET_CAP       = 200; // max per signal before splitting
-
 function assignBets(signals) {
     if (signals.length === 0) return [];
 
-    // Single recovery trigger: globalRetry >= SMART_RECOVERY_FROM (132+)
-    // or any signal already in recoveryMode from previous round
     const inRecovery = db.globalRetry >= SMART_RECOVERY_FROM ||
                        signals.some(s => s.recoveryMode);
 
     if (inRecovery) {
-        // Target: recover to lastWinBalance + 1 unit
         const target  = db.lastWinBalance + BET_LADDER[0];
         const deficit = Math.max(target - db.balance, 0);
-
         const allSorted = signals.slice().sort((a,b) => b.pct-a.pct || b.n-a.n);
         const singleBet = Math.ceil(deficit / PAYOUT_RATE);
 
         if (deficit === 0 || singleBet <= BET_LADDER[0]) {
-            // Already recovered or tiny deficit — reset and fresh bet
             db.globalRetry = 0;
             const best = allSorted[0];
             return [{ ...best, betAmt: BET_LADDER[0], recoveryMode: false }];
         } else if (singleBet <= SPLIT_BET_CAP || allSorted.length === 1) {
-            // Single bet covers it within cap
             const best = allSorted[0];
             return [{ ...best, betAmt: singleBet, recoveryMode: true }];
         } else {
-            // Need to split — find how many signals to keep each <= SPLIT_BET_CAP
             const numNeeded = Math.min(
                 Math.ceil(singleBet / SPLIT_BET_CAP),
                 Math.min(allSorted.length, MAX_RECOVERY_SIGS)
@@ -220,7 +205,6 @@ function assignBets(signals) {
         }
     }
 
-    // Normal betting
     const normal = signals.filter(s => s.retryCount < SPLIT_FROM);
     const high   = signals.filter(s => s.retryCount >= SPLIT_FROM);
     const result = [];
@@ -229,9 +213,7 @@ function assignBets(signals) {
         const carryNormal = normal.filter(s => s.retryCount > 0).sort((a,b) => b.retryCount-a.retryCount || b.pct-a.pct)[0];
         const freshNormal = normal.filter(s => s.retryCount === 0).sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
         const best        = carryNormal || freshNormal;
-        let amt;
-        amt = BET_LADDER[Math.min(db.globalRetry, BET_LADDER.length-1)];
-        result.push({ ...best, betAmt: amt });
+        result.push({ ...best, betAmt: BET_LADDER[Math.min(db.globalRetry, BET_LADDER.length-1)] });
     } else {
         const carryNormal = normal.filter(s => s.retryCount > 0);
         const pool        = [...high, ...carryNormal];
@@ -252,11 +234,32 @@ function secsToNext() {
 const PAD2 = n=>String(n).padStart(2,' ');
 const fmt  = n=>n.toFixed(0);
 
-const bot = new TelegramBot(BOT_TOKEN,{polling:false});
+// Real betting — set LIVE_BET=true in .env to enable
+const { placeBets, testSession, updateSession } = require('./bet');
+let liveBetEnabled = process.env.LIVE_BET === 'true';
+
+const bot = new TelegramBot(BOT_TOKEN,{polling:true});
 function send(text) {
     return bot.sendMessage(CHAT_ID,text,{parse_mode:'Markdown',disable_web_page_preview:true})
               .catch(err=>console.error('[send error]',err.message));
 }
+
+bot.onText(/\/session\s+(\S+)\s+(\S+)/, async (msg, match) => {
+    if (String(msg.chat.id) !== String(CHAT_ID)) return;
+    updateSession(match[1], match[2]);
+    const ok = await testSession();
+    send(ok ? `✅ *Session updated!*` : `❌ *Session invalid!*`);
+});
+bot.onText(/\/liveon/, msg => {
+    if (String(msg.chat.id) !== String(CHAT_ID)) return;
+    liveBetEnabled = true;
+    send(`✅ *Live betting ON*`);
+});
+bot.onText(/\/liveoff/, msg => {
+    if (String(msg.chat.id) !== String(CHAT_ID)) return;
+    liveBetEnabled = false;
+    send(`⏸ *Live betting OFF*`);
+});
 
 function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     const nums  = raw.preDrawCode.split(',').map(Number);
@@ -279,9 +282,9 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
         lines.push('');
         lines.push(`📊 上期验证 (${hits}/${verResults.length} 命中) P&L: ${roundPL>=0?'+':''}${fmt(roundPL)}:`);
         for (const v of verResults) {
-            const plStr  = v.hit?`+${fmt(v.betAmt*PAYOUT_RATE)}`:`-${fmt(v.betAmt)}`;
-            const mode   = v.recoveryMode?'🔄':'';
-            const aIcon  = v.action==='追'?'🔁':'⚔️';
+            const plStr = v.hit?`+${fmt(v.betAmt*PAYOUT_RATE)}`:`-${fmt(v.betAmt)}`;
+            const mode  = v.recoveryMode?'🔄':'';
+            const aIcon = v.action==='追'?'🔁':'⚔️';
             lines.push(`  ${v.hit?'✅':'❌'} ${v.label} 连${v.streakLen}${v.side} ${v.action}${v.chase}${aIcon} → 实际 *${v.actual}* (${plStr}) ${mode}`);
         }
     }
@@ -302,7 +305,11 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     if (db.busted) {
         lines.push(`🛑 *爆仓！已永久停止*`);
     } else if (db.stopped) {
-        lines.push(`🎯 *今日+30%达成！已停止*`);
+        if (db.recoveryRounds >= MAX_RECOVERY_ROUNDS) {
+            lines.push(`🛑 *连续回本失败，今日停止*`);
+        } else {
+            lines.push(`🎯 *今日+30%达成！已停止*`);
+        }
         lines.push(`_次日 2pm MYT 恢复_`);
     } else if (bettedSignals.length === 0) {
         lines.push('_暂无信号_');
@@ -310,7 +317,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
         const totalNextBet = bettedSignals.reduce((sum,s)=>sum+s.betAmt,0);
         const isRecovery   = bettedSignals.some(s=>s.recoveryMode);
         const highCount    = bettedSignals.filter(s=>s.retryCount>=SPLIT_FROM).length;
-        if (isRecovery)       lines.push(`🔄 *回本模式* 目标: ${fmt(db.lastWinBalance+BET_LADDER[0])}`);
+        if (isRecovery)       lines.push(`🔄 *回本模式* 目标: ${fmt(db.lastWinBalance+BET_LADDER[0])} | 回本轮: ${db.recoveryRounds}/${MAX_RECOVERY_ROUNDS}`);
         else if (highCount>1) lines.push(`⚠️ _均摊 ×${highCount}_`);
         lines.push('');
         lines.push(`⭐  总注: *${fmt(totalNextBet)}*`);
@@ -353,7 +360,7 @@ async function init() {
     console.log(`[init] ${db.rawHistory.length} 期 (${db.startIssue} → ${db.lastIssue})`);
     db.dims        = buildDimensions();
     db.signalTable = buildSignalTable(db.rawHistory);
-    console.log(`[init] 静态信号表: ${db.signalTable.length} 条 (>=${HIGHLIGHT}%) — 仅供参考，实际用动态评估`);
+    console.log(`[init] 静态信号表: ${db.signalTable.length} 条 (>=${HIGHLIGHT}%)`);
     console.log(`[init] 动态模式: 每期实时计算当前连线长度和胜率`);
 }
 
@@ -361,11 +368,13 @@ async function poll() {
     const now = new Date();
 
     if (db.stopped && db.resumeAt && now >= db.resumeAt) {
-        db.stopped     = false;
-        db.resumeAt    = null;
-        db.dayStart    = db.balance;
-        db.dailyTarget = Math.ceil(db.balance*(1+DAILY_GROWTH));
+        db.stopped        = false;
+        db.resumeAt       = null;
+        db.dayStart       = db.balance;
+        db.dailyTarget    = Math.ceil(db.balance*(1+DAILY_GROWTH));
         db.pendingSignals = [];
+        db.globalRetry    = 0;
+        db.recoveryRounds = 0;
         console.log(`\n[RESUME] 新一天! 余额:${fmt(db.balance)} 目标:${fmt(db.dailyTarget)}`);
         send([
             `☀️ *新的一天开始！*`,
@@ -397,7 +406,6 @@ async function poll() {
         db.rawHistory.push(raw);
         if (db.rawHistory.length>1000) db.rawHistory.shift();
 
-        // Rebuild signal table every 25 draws
         if (db.drawCount % REBUILD_EVERY === 0) {
             db.signalTable = buildSignalTable(db.rawHistory);
             console.log(`  [REBUILD] 信号表刷新 第${db.drawCount}期: ${db.signalTable.length} 条`);
@@ -440,33 +448,28 @@ async function poll() {
 
             if (!db.busted) {
                 if (hit) {
-                    // Win — reset global martingale, track last win balance
-                    db.globalRetry = 0;
-                    // Only update lastWinBalance if not in recovery (full clean win)
+                    db.globalRetry    = 0;
+                    db.recoveryRounds = 0;
                     if (!ps.recoveryMode) {
                         db.lastWinBalance = db.balance;
                     }
                     console.log(`  [WIN] ${ps.label} 已命中 recovery:${ps.recoveryMode} lastWin:${fmt(db.lastWinBalance)}`);
                 } else if (ps.action === '追') {
-                    // 追 signal lost — streak broke, drop immediately
                     db.globalRetry = Math.min(db.globalRetry+1, BET_LADDER.length-1);
                     console.log(`  [DROP] ${ps.label} 追信号失败，丢弃 globalRetry→${db.globalRetry}`);
                 } else if (ps.retryCount+1 >= MAX_RETRIES) {
-                    // Zombie — drop but keep global retry climbing
                     db.globalRetry = Math.min(db.globalRetry+1, BET_LADDER.length-1);
                     console.log(`  [DROP] ${ps.label} 超过${MAX_RETRIES}次失败，丢弃 globalRetry→${db.globalRetry}`);
                 } else {
-                    // Loss — increment global retry
                     db.globalRetry = Math.min(db.globalRetry+1, BET_LADDER.length-1);
                     const newTotalLost = (ps.totalLost||0)+ps.betAmt;
-                    // If was in recovery, stay in recovery with updated totalLost
                     const stayRecovery = ps.recoveryMode || db.globalRetry >= SMART_RECOVERY_FROM;
                     carryOver.push({
                         ...ps,
-                        retryCount      : ps.retryCount+1,
-                        totalLost       : newTotalLost,
+                        retryCount    : ps.retryCount+1,
+                        totalLost     : newTotalLost,
                         consecutiveLoss,
-                        recoveryMode    : stayRecovery,
+                        recoveryMode  : stayRecovery,
                         nextIssue,
                     });
                     console.log(`  [LOSS] globalRetry→${db.globalRetry} recovery:${stayRecovery} totalLost:${newTotalLost}`);
@@ -480,19 +483,39 @@ async function poll() {
             return;
         }
 
-        // If all recovery signals hit this round → full recovery, update lastWinBalance
-        const recoveryRound = verResults.some(v => v.recoveryMode);
+        // Track recovery rounds
+        const recoveryRound  = verResults.some(v => v.recoveryMode);
         const allRecoveryHit = recoveryRound && verResults.filter(v=>v.recoveryMode).every(v=>v.hit);
+        const anyRecoveryHit = recoveryRound && verResults.some(v=>v.recoveryMode && v.hit);
+        const allRecoveryLost = recoveryRound && verResults.filter(v=>v.recoveryMode).every(v=>!v.hit);
+
         if (allRecoveryHit) {
             db.lastWinBalance = db.balance;
-            db.globalRetry = 0;
+            db.globalRetry    = 0;
+            db.recoveryRounds = 0;
             console.log(`  [RECOVERY COMPLETE] lastWinBalance→${fmt(db.lastWinBalance)}`);
+        } else if (anyRecoveryHit) {
+            console.log(`  [RECOVERY PARTIAL] continuing...`);
+        } else if (allRecoveryLost) {
+            db.recoveryRounds++;
+            console.log(`  [RECOVERY FAIL] round ${db.recoveryRounds}/${MAX_RECOVERY_ROUNDS}`);
+            if (db.recoveryRounds >= MAX_RECOVERY_ROUNDS) {
+                db.stopped  = true;
+                db.resumeAt = nextResume();
+                console.log(`  [STOP] 连续${MAX_RECOVERY_ROUNDS}次回本失败，今日停止`);
+            }
         }
 
         if (db.balance >= db.dailyTarget) {
             db.stopped  = true;
             db.resumeAt = nextResume();
             console.log(`  [TARGET] +30%达成! 次日2pm MYT恢复`);
+            send(buildMsg(raw, [], verResults, nextIssue));
+            setTimeout(poll,nextMs);
+            return;
+        }
+
+        if (db.stopped) {
             send(buildMsg(raw, [], verResults, nextIssue));
             setTimeout(poll,nextMs);
             return;
@@ -516,6 +539,27 @@ async function poll() {
         const bettedSignals = assignBets(merged);
         db.pendingSignals = bettedSignals.map(s=>({ ...s, nextIssue }));
 
+        // Place real bets if live mode enabled
+        if (liveBetEnabled && bettedSignals.length > 0) {
+            placeBets(bettedSignals, nextIssue).then(result => {
+                if (!result.success) {
+                    if (result.error === 'SESSION_EXPIRED') {
+                        liveBetEnabled = false;
+                        send(`🔐 *Session过期！下注已暂停*\n请重新登录后发送:\n/session JSESSIONID TOKEN`);
+                    } else {
+                        send(`⚠️ *下注失败!*\n\`${JSON.stringify(result.error)}\``);
+                    }
+                }
+            }).catch(err => {
+                if (err.message === 'SESSION_EXPIRED') {
+                    liveBetEnabled = false;
+                    send(`🔐 *Session过期！下注已暂停*\n请重新登录后发送:\n/session JSESSIONID TOKEN`);
+                } else {
+                    send(`⚠️ *下注异常!*\n\`${err.message}\``);
+                }
+            });
+        }
+
         if (!bettedSignals.length && !verResults.length) {
             console.log('  [silent] no signals');
         }
@@ -532,17 +576,25 @@ async function poll() {
 }
 
 (async()=>{
-    console.log('Dragon Sim Bot (杀+追 混合)');
+    console.log('Dragon Sim Bot');
     console.log(`   Chat: ${CHAT_ID}  Threshold: >=${HIGHLIGHT}%  MIN_N: ${MIN_N}  Starting: ${STARTING_BALANCE}`);
-    console.log(`   Ladder: ${BET_LADDER.join('>')}  Split@${BET_LADDER[SPLIT_FROM]}  SmartRecovery@${BET_LADDER[SMART_RECOVERY_FROM]}`);
-     console.log(`   Daily: +${DAILY_GROWTH*100}% target  2pm MYT resume  Rebuild every ${REBUILD_EVERY} draws`);
+    console.log(`   Ladder: ${BET_LADDER.join('→')}  SplitCap:${SPLIT_BET_CAP}  SmartRecovery@step${SMART_RECOVERY_FROM}  MaxRecoveryRounds:${MAX_RECOVERY_ROUNDS}`);
+    console.log(`   Daily: +${DAILY_GROWTH*100}% target  2pm MYT resume  Rebuild every ${REBUILD_EVERY} draws`);
     console.log('');
     try{await init();}catch(e){console.error('[init error]',e.message);process.exit(1);}
+    if (liveBetEnabled) {
+        console.log('[live] LIVE_BET enabled — testing session...');
+        const ok = await testSession();
+        if (!ok) { console.error('[live] Session invalid — set SITE_JSESSIONID and SITE_TOKEN in .env'); process.exit(1); }
+        console.log('[live] Session valid ✅');
+    } else {
+        console.log('[live] LIVE_BET disabled — simulation mode only');
+    }
     send([
-        `🐲 *Dragon Sim Bot 已启动 (杀+追)*`,
+        `🐲 *Dragon Sim Bot 已启动*`,
         `💰 余额: *${STARTING_BALANCE}*  🎯 目标: *${Math.ceil(STARTING_BALANCE*(1+DAILY_GROWTH))}*`,
-        `🪜 梯注: ${BET_LADDER.join('→')}  分拆@${BET_LADDER[SPLIT_FROM]} (智能回本)`,
-        `🔄 智能回本: 第3次失败后(132+)精确计算回本注`,
+        `🪜 梯注: ${BET_LADDER.join('→')}  分拆@${SPLIT_BET_CAP} (智能回本)`,
+        `🔄 智能回本: step${SMART_RECOVERY_FROM}+精确计算 连${MAX_RECOVERY_ROUNDS}次全败→停止`,
         `🔁 每${REBUILD_EVERY}期刷新信号表`,
         `🎯 达标停止，次日2pm MYT恢复`,
         `🛑 硬顶: 亏损${HARD_CAP_LOSS}永久停止`,
