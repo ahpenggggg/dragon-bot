@@ -44,7 +44,7 @@ const SPLIT_FROM       = 3;
 const MAX_RECOVERY_SIGS = 6;
 const STARTING_BALANCE = 2000;
 const HARD_CAP_LOSS    = 2000;
-const DAILY_GROWTH     = 2.0;
+const DAILY_GROWTH     = 0.30;
 const RESUME_HOUR_MYT  = 14;
 const REBUILD_EVERY    = 25;
 const PAYOUT_RATE      = 0.96;
@@ -579,10 +579,6 @@ async function poll() {
     console.log(`   Daily: +${DAILY_GROWTH*100}% target  2pm MYT resume  Rebuild every ${REBUILD_EVERY} draws`);
     console.log('');
     try{await init();}catch(e){console.error('[init error]',e.message);process.exit(1);}
-        console.log('[live] Session valid ✅');
-    } else {
-        console.log('[live] LIVE_BET disabled — simulation mode only');
-    }
     send([
         `🐲 *Dragon Sim Bot 已启动*`,
         `💰 余额: *${STARTING_BALANCE}*  🎯 目标: *${Math.ceil(STARTING_BALANCE*(1+DAILY_GROWTH))}*`,
