@@ -9,8 +9,8 @@ const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_SIM_CHAT_ID_HERE';
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
-const HIGHLIGHT        = 70;
-const MIN_N            = 10;
+const HIGHLIGHT        = 65;
+const MIN_N            = 8;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
 // Dynamic ladder — scales with capital (mid-risk: ~45-50% exposure)
 const LADDER_TIERS = [
@@ -33,23 +33,18 @@ function getCurrentBase() {
 }
 
 function getCurrentLadder() {
-    const base   = getCurrentBase();
-    const ladder = [base];
-    for (let i = 1; i < 6; i++) {
-        const sumPrev = ladder.reduce((s,x)=>s+x, 0);
-        ladder.push(Math.round(sumPrev * 1.1));
-    }
-    return ladder;
+    const base = getCurrentBase();
+    return [1, 2, 4, 8, 16, 32].map(m => base * m);
 }
 
 // Keep BET_LADDER as a reference for startup display only
-const BET_LADDER = [25, 28, 58, 122, 256, 538];
+const BET_LADDER = [25, 50, 100, 200, 400, 800];
 const RECOVERY_AFTER   = 4;
 const SPLIT_FROM       = 3;
 const MAX_RECOVERY_SIGS = 6;
 const STARTING_BALANCE = 2000;
 const HARD_CAP_LOSS    = 2000;
-const DAILY_GROWTH     = 0.30;
+const DAILY_GROWTH     = 2.0;
 const RESUME_HOUR_MYT  = 14;
 const REBUILD_EVERY    = 25;
 const PAYOUT_RATE      = 0.96;
