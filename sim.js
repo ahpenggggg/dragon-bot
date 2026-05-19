@@ -9,8 +9,8 @@ const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_SIM_CHAT_ID_HERE';
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
-const HIGHLIGHT        = 60;
-const MIN_N            = 6;
+const HIGHLIGHT        = 70;
+const MIN_N            = 7;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
 // Dynamic ladder — scales with capital (mid-risk: ~45-50% exposure)
 const LADDER_TIERS = [
