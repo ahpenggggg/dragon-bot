@@ -44,7 +44,7 @@ const SPLIT_FROM       = 3;
 const MAX_RECOVERY_SIGS = 6;
 const STARTING_BALANCE = 2000;
 const HARD_CAP_LOSS    = 2000;
-const DAILY_GROWTH     = 0.40;
+const DAILY_GROWTH     = 2.0;
 const RESUME_HOUR_MYT  = 14;
 const REBUILD_EVERY    = 25;
 const PAYOUT_RATE      = 0.96;
@@ -263,32 +263,12 @@ function secsToNext() {
 const PAD2 = n=>String(n).padStart(2,' ');
 const fmt  = n=>n.toFixed(0);
 
-// Real betting — set LIVE_BET=true in .env to enable
-const { placeBets, testSession, updateSession } = require('./bet');
-let liveBetEnabled = process.env.LIVE_BET === 'true';
-
-const bot = new TelegramBot(BOT_TOKEN,{polling:true});
+const bot = new TelegramBot(BOT_TOKEN,{polling:false});
 function send(text) {
     return bot.sendMessage(CHAT_ID,text,{parse_mode:'Markdown',disable_web_page_preview:true})
               .catch(err=>console.error('[send error]',err.message));
 }
 
-bot.onText(/\/session\s+(\S+)\s+(\S+)/, async (msg, match) => {
-    if (String(msg.chat.id) !== String(CHAT_ID)) return;
-    updateSession(match[1], match[2]);
-    const ok = await testSession();
-    send(ok ? `✅ *Session updated!*` : `❌ *Session invalid!*`);
-});
-bot.onText(/\/liveon/, msg => {
-    if (String(msg.chat.id) !== String(CHAT_ID)) return;
-    liveBetEnabled = true;
-    send(`✅ *Live betting ON*`);
-});
-bot.onText(/\/liveoff/, msg => {
-    if (String(msg.chat.id) !== String(CHAT_ID)) return;
-    liveBetEnabled = false;
-    send(`⏸ *Live betting OFF*`);
-});
 
 function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     const nums  = raw.preDrawCode.split(',').map(Number);
@@ -577,27 +557,6 @@ async function poll() {
         const bettedSignals = assignBets(merged);
         db.pendingSignals = bettedSignals.map(s=>({ ...s, nextIssue }));
 
-        // Place real bets if live mode enabled
-        if (liveBetEnabled && bettedSignals.length > 0) {
-            placeBets(bettedSignals, nextIssue).then(result => {
-                if (!result.success) {
-                    if (result.error === 'SESSION_EXPIRED') {
-                        liveBetEnabled = false;
-                        send(`🔐 *Session过期！下注已暂停*\n请重新登录后发送:\n/session JSESSIONID TOKEN`);
-                    } else {
-                        send(`⚠️ *下注失败!*\n\`${JSON.stringify(result.error)}\``);
-                    }
-                }
-            }).catch(err => {
-                if (err.message === 'SESSION_EXPIRED') {
-                    liveBetEnabled = false;
-                    send(`🔐 *Session过期！下注已暂停*\n请重新登录后发送:\n/session JSESSIONID TOKEN`);
-                } else {
-                    send(`⚠️ *下注异常!*\n\`${err.message}\``);
-                }
-            });
-        }
-
         if (!bettedSignals.length && !verResults.length) {
             console.log('  [silent] no signals');
         }
@@ -620,10 +579,6 @@ async function poll() {
     console.log(`   Daily: +${DAILY_GROWTH*100}% target  2pm MYT resume  Rebuild every ${REBUILD_EVERY} draws`);
     console.log('');
     try{await init();}catch(e){console.error('[init error]',e.message);process.exit(1);}
-    if (liveBetEnabled) {
-        console.log('[live] LIVE_BET enabled — testing session...');
-        const ok = await testSession();
-        if (!ok) { console.error('[live] Session invalid — set SITE_JSESSIONID and SITE_TOKEN in .env'); process.exit(1); }
         console.log('[live] Session valid ✅');
     } else {
         console.log('[live] LIVE_BET disabled — simulation mode only');
