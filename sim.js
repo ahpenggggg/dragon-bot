@@ -9,22 +9,22 @@ const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_SIM_CHAT_ID_HERE';
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
-const HIGHLIGHT        = 65;
-const MIN_N            = 8;
+const HIGHLIGHT        = 60;
+const MIN_N            = 6;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
 // Dynamic ladder — scales with capital (mid-risk: ~45-50% exposure)
 const LADDER_TIERS = [
-    { capital:  4400, base:  25 },
-    { capital:  5700, base:  30 },
-    { capital:  7400, base:  45 },
-    { capital:  9600, base:  50 },
-    { capital: 12500, base:  70 },
-    { capital: 16000, base:  90 },
-    { capital: 21000, base: 125 },
-    { capital: 27000, base: 150 },
-    { capital: 35000, base: 200 },
-    { capital: 45000, base: 250 },
-    { capital: Infinity, base: 350 },
+    { capital:  2200, base:  12 },
+    { capital:  2900, base:  15 },
+    { capital:  3700, base:  20 },
+    { capital:  4800, base:  25 },
+    { capital:  6300, base:  35 },
+    { capital:  8000, base:  45 },
+    { capital: 10500, base:  60 },
+    { capital: 13500, base:  75 },
+    { capital: 17500, base: 100 },
+    { capital: 22500, base: 125 },
+    { capital: Infinity, base: 175 },
 ];
 
 function getCurrentBase() {
@@ -38,15 +38,15 @@ function getCurrentLadder() {
 }
 
 // Keep BET_LADDER as a reference for startup display only
-const BET_LADDER = [25, 50, 100, 200, 400, 800];
+const BET_LADDER = [12, 24, 48, 96, 192, 384];
 const RECOVERY_AFTER   = 4;
 const SPLIT_FROM       = 3;
 const MAX_RECOVERY_SIGS = 6;
-const STARTING_BALANCE = 2000;
-const HARD_CAP_LOSS    = 2000;
-const DAILY_GROWTH     = 2.0;
+const STARTING_BALANCE = 1000;
+const HARD_CAP_LOSS    = 1000;
+const DAILY_GROWTH     = 0.30;
 const RESUME_HOUR_MYT  = 14;
-const REBUILD_EVERY    = 25;
+const REBUILD_EVERY    = 15;
 const PAYOUT_RATE      = 0.96;
 const MAX_RETRIES      = 5;
 const SMART_RECOVERY_FROM = 2;
@@ -200,6 +200,44 @@ function nextResume() {
     return resume;
 }
 
+function getRecoverySignals() {
+    // During recovery, use ALL available signals >= 55% break rate
+    // regardless of current HIGHLIGHT threshold
+    // Always target a 4-way split for variance reduction
+    const active = [];
+    const seen   = new Set();
+    const RECOVERY_MIN_PCT = 55;
+    const RECOVERY_MIN_N   = 5;
+    const MIN_STREAK       = 3;
+
+    for (const dim of db.dims) {
+        if (db.rawHistory.length === 0) continue;
+        const lastVal   = dim.fn(db.rawHistory[db.rawHistory.length-1]);
+        const streakLen = currentStreakLen(db.rawHistory, dim.fn, lastVal);
+        if (streakLen < MIN_STREAK) continue;
+
+        const vals = db.rawHistory.map(dim.fn);
+        const res  = countStreakFollowup(vals, streakLen);
+        const s    = res.bySide[lastVal];
+        if (!s || s.total < RECOVERY_MIN_N) continue;
+
+        const pair = dim.id.includes('DS')?['单','双']:['大','小'];
+        const opp  = pair.find(x=>x!==lastVal);
+        const bPct = Math.round(s.break/s.total*100);
+
+        if (bPct >= RECOVERY_MIN_PCT) {
+            const key = `${dim.id}|${lastVal}|${streakLen}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                active.push({ dimId:dim.id, label:dim.label, side:lastVal, len:streakLen, action:'杀', chase:opp, pct:bPct, n:s.total });
+            }
+        }
+    }
+
+    active.sort((a,b) => b.pct-a.pct || b.n-a.n);
+    return active;
+}
+
 function assignBets(signals) {
     if (signals.length === 0) return [];
 
@@ -212,24 +250,35 @@ function assignBets(signals) {
     if (inRecovery) {
         const target  = db.lastWinBalance + BASE;
         const deficit = Math.max(target - db.balance, 0);
-        const allSorted = signals.slice().sort((a,b) => b.pct-a.pct || b.n-a.n);
-        const singleBet = Math.ceil(deficit / PAYOUT_RATE);
 
-        if (deficit === 0 || singleBet <= BASE) {
+        if (deficit === 0) {
             db.globalRetry = 0;
-            const best = allSorted[0];
+            const best = signals.slice().sort((a,b) => b.pct-a.pct || b.n-a.n)[0];
             return [{ ...best, betAmt: BASE, recoveryMode: false }];
-        } else if (singleBet <= SPLIT_BET_CAP || allSorted.length === 1) {
-            const best = allSorted[0];
-            return [{ ...best, betAmt: singleBet, recoveryMode: true }];
+        }
+
+        // Get expanded signal pool (>=55%) for recovery
+        const recoveryPool = getRecoverySignals();
+
+        // Always aim for 4-way split, fall back to available signals
+        const TARGET_SPLITS = 4;
+        const pool = recoveryPool.length >= TARGET_SPLITS
+            ? recoveryPool.slice(0, TARGET_SPLITS)
+            : recoveryPool.length > 0
+                ? recoveryPool
+                : signals.slice(0, TARGET_SPLITS); // fallback to normal signals
+
+        // Dynamic: if single bet fits, use single; otherwise split across pool
+        const singleBet = Math.ceil(deficit / PAYOUT_RATE);
+        const splitCount = pool.length;
+
+        if (singleBet <= BASE || pool.length === 1) {
+            // Small deficit — single bet
+            return [{ ...pool[0], betAmt: Math.max(singleBet, BASE), recoveryMode: true }];
         } else {
-            const numNeeded = Math.min(
-                Math.ceil(singleBet / SPLIT_BET_CAP),
-                Math.min(allSorted.length, MAX_RECOVERY_SIGS)
-            );
-            const pool  = allSorted.slice(0, numNeeded);
-            let perSig  = Math.ceil((deficit / pool.length) / PAYOUT_RATE);
-            perSig      = Math.max(perSig, BASE);
+            // Split across pool — each signal covers 1/N of deficit
+            let perSig = Math.ceil((deficit / splitCount) / PAYOUT_RATE);
+            perSig     = Math.max(perSig, BASE);
             return pool.map(s => ({ ...s, betAmt: perSig, recoveryMode: true }));
         }
     }
