@@ -9,8 +9,8 @@ const CHAT_ID   = process.env.SIM_CHAT_ID   || 'YOUR_SIM_CHAT_ID_HERE';
 const API_LATEST  = 'https://api.api168168.com/pks/getLotteryPksInfo.do?lotCode=10037';
 const API_HISTORY = 'https://api.api168168.com/pks/getPksHistoryList.do?lotCode=10037';
 
-const HIGHLIGHT        = 60;
-const MIN_N            = 6;
+const HIGHLIGHT        = 70;
+const MIN_N            = 10;
 const CHECKS           = [2, 3, 4, 5, 6, 7];
 // Dynamic ladder — scales with capital (mid-risk: ~45-50% exposure)
 const LADDER_TIERS = [
@@ -46,12 +46,12 @@ const STARTING_BALANCE = 1000;
 const HARD_CAP_LOSS    = 1000;
 const DAILY_GROWTH     = 0.30;
 const RESUME_HOUR_MYT  = 14;
-const REBUILD_EVERY    = 15;
+const REBUILD_EVERY    = 25;
 const PAYOUT_RATE      = 0.96;
 const MAX_RETRIES      = 5;
 const SMART_RECOVERY_FROM = 2;
-const SPLIT_BET_CAP       = 200;
-const MAX_RECOVERY_ROUNDS = 3;
+const SPLIT_BET_CAP       = 192; // split into 4-way when single bet reaches 192
+const MAX_RECOVERY_ROUNDS = 99; // effectively disabled — hard cap protects instead
 
 const posLabels = ['冠军','亚军','第三','第四','第五','第六','第七','第八','第九','第十'];
 
@@ -268,18 +268,22 @@ function assignBets(signals) {
                 ? recoveryPool
                 : signals.slice(0, TARGET_SPLITS); // fallback to normal signals
 
-        // Dynamic: if single bet fits, use single; otherwise split across pool
+        // Dynamic: single bet if small deficit, 4-way split at SPLIT_BET_CAP
         const singleBet = Math.ceil(deficit / PAYOUT_RATE);
-        const splitCount = pool.length;
 
-        if (singleBet <= BASE || pool.length === 1) {
-            // Small deficit — single bet
-            return [{ ...pool[0], betAmt: Math.max(singleBet, BASE), recoveryMode: true }];
+        if (singleBet <= BASE) {
+            // Tiny deficit — single bet at base
+            return [{ ...pool[0], betAmt: BASE, recoveryMode: true }];
+        } else if (singleBet <= SPLIT_BET_CAP) {
+            // Single bet covers it under cap
+            return [{ ...pool[0], betAmt: singleBet, recoveryMode: true }];
         } else {
-            // Split across pool — each signal covers 1/N of deficit
+            // At or above SPLIT_BET_CAP — always 4-way split
+            const splitCount = Math.min(pool.length, 4);
+            const splitPool  = pool.slice(0, splitCount);
             let perSig = Math.ceil((deficit / splitCount) / PAYOUT_RATE);
             perSig     = Math.max(perSig, BASE);
-            return pool.map(s => ({ ...s, betAmt: perSig, recoveryMode: true }));
+            return splitPool.map(s => ({ ...s, betAmt: perSig, recoveryMode: true }));
         }
     }
 
@@ -363,11 +367,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
     if (db.busted) {
         lines.push(`🛑 *爆仓！已永久停止*`);
     } else if (db.stopped) {
-        if (db.recoveryRounds >= MAX_RECOVERY_ROUNDS) {
-            lines.push(`🛑 *连续回本失败，今日停止*`);
-        } else {
-            lines.push(`🎯 *今日+30%达成！已停止*`);
-        }
+        lines.push(`🎯 *今日+30%达成！已停止*`);
         lines.push(`_次日 2pm MYT 恢复_`);
     } else if (bettedSignals.length === 0) {
         lines.push('_暂无信号_');
@@ -375,7 +375,7 @@ function buildMsg(raw, bettedSignals, verResults, nextIssue) {
         const totalNextBet = bettedSignals.reduce((sum,s)=>sum+s.betAmt,0);
         const isRecovery   = bettedSignals.some(s=>s.recoveryMode);
         const highCount    = bettedSignals.filter(s=>s.retryCount>=SPLIT_FROM).length;
-        if (isRecovery)       lines.push(`🔄 *回本模式* 目标: ${fmt(db.lastWinBalance+getCurrentBase())} | 回本轮: ${db.recoveryRounds}/${MAX_RECOVERY_ROUNDS}`);
+        if (isRecovery)       lines.push(`🔄 *回本模式* 目标: ${fmt(db.lastWinBalance+getCurrentBase())} | 已回本${db.recoveryRounds}轮`);
         else if (highCount>1) lines.push(`⚠️ _均摊 ×${highCount}_`);
         lines.push('');
         lines.push(`⭐  总注: *${fmt(totalNextBet)}*`);
@@ -565,12 +565,7 @@ async function poll() {
             console.log(`  [RECOVERY PARTIAL] continuing...`);
         } else if (allRecoveryLost) {
             db.recoveryRounds++;
-            console.log(`  [RECOVERY FAIL] round ${db.recoveryRounds}/${MAX_RECOVERY_ROUNDS}`);
-            if (db.recoveryRounds >= MAX_RECOVERY_ROUNDS) {
-                db.stopped  = true;
-                db.resumeAt = nextResume();
-                console.log(`  [STOP] 连续${MAX_RECOVERY_ROUNDS}次回本失败，今日停止`);
-            }
+            console.log(`  [RECOVERY FAIL] round ${db.recoveryRounds} — continuing (hard cap protects)`);
         }
 
         if (db.balance >= db.dailyTarget) {
@@ -632,7 +627,7 @@ async function poll() {
         `🐲 *Dragon Sim Bot 已启动*`,
         `💰 余额: *${STARTING_BALANCE}*  🎯 目标: *${Math.ceil(STARTING_BALANCE*(1+DAILY_GROWTH))}*`,
         `🪜 梯注: ${getCurrentLadder().join('→')} (base ${getCurrentBase()}, 自动升档)`,
-        `🔄 智能回本: step${SMART_RECOVERY_FROM}+精确计算 连${MAX_RECOVERY_ROUNDS}次全败→停止`,
+        `🔄 智能回本: step${SMART_RECOVERY_FROM}+精确计算 4路分拆，硬顶保护`,
         `🔁 每${REBUILD_EVERY}期刷新信号表`,
         `🎯 达标停止，次日2pm MYT恢复`,
         `🛑 硬顶: 亏损${HARD_CAP_LOSS}永久停止`,
